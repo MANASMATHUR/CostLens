@@ -8,6 +8,7 @@ import { InfraView } from "./views/InfraView";
 import { BuildView } from "./views/BuildView";
 import { BuyerView } from "./views/BuyerView";
 import { RiskView } from "./views/RiskView";
+import { CompetitorView } from "./views/CompetitorView";
 import { ExecutiveSummary } from "./components/ExecutiveSummary";
 import { ExportBar } from "./components/ExportBar";
 import { saveReport, loadReport } from "./utils/history";
@@ -136,10 +137,10 @@ export default function App() {
           return;
         }
         const runs = data.runs || {};
-        const done = [runs.infra, runs.build, runs.buyer, runs.risk].filter((s) => s === "COMPLETED" || s === "FAILED").length;
-        lastProgress = 20 + Math.round((done / 4) * 60);
+        const done = [runs.infra, runs.build, runs.buyer, runs.risk, runs.competitors].filter((s) => s === "COMPLETED" || s === "FAILED").length;
+        lastProgress = 20 + Math.round((done / 5) * 60);
         setProgress(lastProgress);
-        setAction(`Waiting for scans... (${done}/4 done)`);
+        setAction(`Waiting for scans... (${done}/5 done)`);
       }
       throw new Error("Investigation took too long. Try again or use a simpler URL.");
     } catch (err) {
@@ -158,6 +159,15 @@ export default function App() {
     }
   }, []);
 
+  const handleGoHome = useCallback(() => {
+    setResults(null);
+    setView(null);
+    setUrl("");
+    setScanError("");
+    setExpandedInfra(null);
+    setExpandedBuild(null);
+  }, []);
+
   const hasResults = Boolean(results);
   const R = normalizeReport(results);
   const degradedSet = new Set(R.quality.degradedPillars || []);
@@ -166,6 +176,7 @@ export default function App() {
     ["build", "Build Cost"],
     ["buyer", "Your Cost"],
     ["risk", "Risk"],
+    ["competitors", "Competitors"],
   ];
   const degradedReason = (pillar) => {
     const scanner = R.quality?.scannerErrors?.[pillar];
@@ -186,7 +197,7 @@ export default function App() {
 
       {scanning && <ScanOverlay progress={progress} action={action} platforms={scanPlatforms} />}
 
-      <AppHeader hasResults={hasResults} view={view} onViewChange={setView} tabMeta={tabMeta} degradedSet={degradedSet} degradedReason={degradedReason} />
+      <AppHeader hasResults={hasResults} view={view} onViewChange={setView} onGoHome={handleGoHome} tabMeta={tabMeta} degradedSet={degradedSet} degradedReason={degradedReason} />
 
       <main id="main-content" ref={mainRef} tabIndex={-1} style={{ maxWidth: hasResults ? 1000 : undefined, width: "100%", margin: "0 auto", padding: hasResults ? `${space.xl}px ${space.xxl}px 64px` : 0 }} aria-label="Main content">
         {!hasResults && (
@@ -236,6 +247,11 @@ export default function App() {
             {view === "risk" && (
               <section role="tabpanel" id="panel-risk" aria-labelledby="tab-risk">
                 <RiskView report={R} degraded={degradedSet.has("risk")} degradedReason={degradedReason} />
+              </section>
+            )}
+            {view === "competitors" && (
+              <section role="tabpanel" id="panel-competitors" aria-labelledby="tab-competitors">
+                <CompetitorView report={R} />
               </section>
             )}
           </div>

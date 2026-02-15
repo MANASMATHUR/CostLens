@@ -726,6 +726,72 @@ Third-Party Trackers: ${JSON.stringify(riskData?.trackers || [])}`,
     };
   }
 
+  // ── Feature: Competitor Landscape Analysis ─────────────────
+  async generateCompetitorAnalysis(competitorsRaw, buyerCost, targetInfo) {
+    try {
+      const rawCompetitors = competitorsRaw?.competitors || [];
+      if (rawCompetitors.length === 0) return null;
+
+      const parsed = await this.requestJsonWithRetry({
+        messages: [
+          {
+            role: "system",
+            content: `You are a SaaS competitive intelligence analyst. Given a target product and its discovered competitors, produce a competitive landscape analysis.
+Return strict JSON only:
+{
+  "landscape": "1-2 paragraph overview of the competitive landscape and market dynamics.",
+  "competitors": [{ "name": "string", "url": "string", "description": "string", "startingPrice": "string", "positioning": { "priceLevel": number (1-5, 1=cheapest), "featureRichness": number (1-5, 1=simplest) }, "prosVsTarget": ["string (1-3 advantages over the target)"], "consVsTarget": ["string (1-3 disadvantages vs the target)"] }],
+  "targetPositioning": { "priceLevel": number (1-5), "featureRichness": number (1-5) },
+  "verdict": "string — one sentence on where the target stands competitively"
+}
+Be factual and concise. Limit to the top 5 competitors.`,
+          },
+          {
+            role: "user",
+            content: `Competitor analysis for ${targetInfo.name} (${targetInfo.url}):
+Discovered Competitors: ${JSON.stringify(rawCompetitors)}
+Target Buyer Pricing: ${JSON.stringify(buyerCost || {})}`,
+          },
+        ],
+        maxTokens: 2000,
+      });
+      return this.normalizeCompetitorAnalysis(parsed);
+    } catch (error) {
+      console.error("[CostLens] Competitor analysis generation failed:", error);
+      return null;
+    }
+  }
+
+  normalizeCompetitorAnalysis(value) {
+    const input = this.asObject(value);
+    const landscape = this.asString(input.landscape, "");
+    const competitors = Array.isArray(input.competitors)
+      ? input.competitors.map((c) => ({
+          name: this.asString(c?.name, "Unknown"),
+          url: this.asString(c?.url, ""),
+          description: this.asString(c?.description, ""),
+          startingPrice: this.asString(c?.startingPrice, "Unknown"),
+          positioning: {
+            priceLevel: Math.max(1, Math.min(5, this.asNumber(c?.positioning?.priceLevel, 3))),
+            featureRichness: Math.max(1, Math.min(5, this.asNumber(c?.positioning?.featureRichness, 3))),
+          },
+          prosVsTarget: Array.isArray(c?.prosVsTarget) ? c.prosVsTarget.map((x) => this.asString(x)).filter(Boolean).slice(0, 3) : [],
+          consVsTarget: Array.isArray(c?.consVsTarget) ? c.consVsTarget.map((x) => this.asString(x)).filter(Boolean).slice(0, 3) : [],
+        })).filter((c) => c.name !== "Unknown")
+      : [];
+    if (competitors.length === 0) return null;
+    const targetPositioning = {
+      priceLevel: Math.max(1, Math.min(5, this.asNumber(input.targetPositioning?.priceLevel, 3))),
+      featureRichness: Math.max(1, Math.min(5, this.asNumber(input.targetPositioning?.featureRichness, 3))),
+    };
+    return {
+      landscape,
+      competitors,
+      targetPositioning,
+      verdict: this.asString(input.verdict, "Competitive positioning data insufficient."),
+    };
+  }
+
   errorMessage(error) {
     if (!error) return "Unknown model error";
     if (typeof error === "string") return error;

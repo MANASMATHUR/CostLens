@@ -152,7 +152,7 @@ function assertValidAsyncPollPayload(body) {
     err.statusCode = 400;
     throw err;
   }
-  const keys = ["infra", "build", "buyer", "risk"];
+  const keys = ["infra", "build", "buyer", "risk", "competitors"];
   for (const key of keys) {
     const id = runIds[key];
     if (id !== undefined && id !== null && typeof id !== "string") {
@@ -192,19 +192,21 @@ function buildQualityMeta({ scannerErrors, modelErrors, modelWarnings, anomalies
     build: fastMode ? 1 : 3,
     buyer: fastMode ? 1 : 5,
     risk: fastMode ? 1 : 3,
+    competitors: fastMode ? 1 : 1,
   };
   const expectedTasks = {
     infra: fastMode ? 1 : 4,
     build: fastMode ? 1 : 3,
     buyer: fastMode ? 1 : 4,
     risk: fastMode ? 1 : 3,
+    competitors: fastMode ? 1 : 1,
   };
   const perPillar = {};
   const sourceCoverage = {};
   const dataFreshness = {};
   const pillarCoverage = {};
   const confidenceScore = {};
-  const pillars = ["infra", "build", "buyer", "risk"];
+  const pillars = ["infra", "build", "buyer", "risk", "competitors"];
   for (const pillar of pillars) {
     const meta = pillarMeta[pillar] || normalizePillarMeta(null, pillar);
     const uniqueFamilies = Array.isArray(meta.sourceFamilies) ? [...new Set(meta.sourceFamilies.filter(Boolean))] : [];
@@ -238,7 +240,7 @@ function buildQualityMeta({ scannerErrors, modelErrors, modelWarnings, anomalies
       tasksExpected: expectedTasks[pillar],
     };
   }
-  const global = Math.round((confidenceScore.infra + confidenceScore.build + confidenceScore.buyer + confidenceScore.risk) / pillars.length);
+  const global = Math.round(pillars.reduce((sum, p) => sum + (confidenceScore[p] || 0), 0) / pillars.length);
   confidenceScore.global = global;
   confidenceScore.level = global >= 80 ? "high" : global >= 60 ? "medium" : "low";
   const crossChecks = (Array.isArray(anomalies) ? anomalies : []).map((note, idx) => ({
@@ -253,7 +255,7 @@ async function runInvestigation({ targetUrl, domain, onProgress }) {
   const name = domain.split(".")[0].charAt(0).toUpperCase() + domain.split(".")[0].slice(1);
   const tinyfish = new TinyFishWebAgentClient(config.tinyfish);
   const emit = onProgress || (() => {});
-  const scannerErrors = { infra: null, build: null, buyer: null, risk: null };
+  const scannerErrors = { infra: null, build: null, buyer: null, risk: null, competitors: null };
   const fastOpt = { fast: config.fastMode };
 
   const runScanner = async (key, scannerPromiseFactory, fallback) => {
@@ -373,6 +375,7 @@ async function runInvestigation({ targetUrl, domain, onProgress }) {
     build: normalizePillarMeta(buildRaw, "build"),
     buyer: normalizePillarMeta(buyerRaw, "buyer"),
     risk: normalizePillarMeta(riskRaw, "risk"),
+    competitors: normalizePillarMeta(null, "competitors"),
   };
   const qualityMeta = buildQualityMeta({
     scannerErrors,
@@ -383,7 +386,7 @@ async function runInvestigation({ targetUrl, domain, onProgress }) {
     timedOut,
     fastMode: Boolean(config.fastMode),
   });
-  const totalPillars = 4;
+  const totalPillars = 5;
   const legacyCompleteness = Math.max(0, Math.round(((totalPillars - Math.min(totalPillars, degradedPillars.length)) / totalPillars) * 100));
 
   return {
@@ -431,6 +434,10 @@ async function runInvestigation({ targetUrl, domain, onProgress }) {
       risk: {
         evidenceSources: [],
         extractedAt: pillarMeta.risk.extractedAt,
+      },
+      competitors: {
+        evidenceSources: [],
+        extractedAt: pillarMeta.competitors.extractedAt,
       },
     },
     quality: {
@@ -485,6 +492,15 @@ function getFastAsyncGoals(targetUrl, domain) {
         `Analyze ${domain} for security and compliance signals.`,
         'Return strict JSON only: { "securityHeaders": { "https": true, "hsts": true, "csp": true, "xFrameOptions": "string|null", "xContentTypeOptions": true }, "privacyCompliance": { "privacyPolicyUrl": "string|null", "termsUrl": "string|null", "complianceBadges": ["string"], "cookieConsent": true }, "trackers": [{ "tracker": "string", "category": "analytics|advertising|social|functional|other", "dataShared": "string" }] }',
         "Be conservative. Only list compliance badges if evidence exists on the site.",
+      ].join(" "),
+    },
+    competitors: {
+      url: targetUrl.startsWith("http") ? targetUrl : `https://${targetUrl}`,
+      goal: [
+        `Find the top 3-5 competitors or alternatives to ${name}. Visit comparison/alternatives pages, G2, Capterra, or similar sites if helpful.`,
+        `For each competitor return their name, website URL, a one-line description, and approximate starting price.`,
+        'Return strict JSON only: { "competitors": [{ "name": "string", "url": "string", "description": "string", "startingPrice": "string", "keyDifferentiator": "string" }] }',
+        "Only include competitors you are confident about. If unsure, return fewer.",
       ].join(" "),
     },
   };
@@ -590,6 +606,16 @@ function coerceRunResultToRisk(result) {
   };
 }
 
+function coerceRunResultToCompetitors(result) {
+  if (!result || typeof result !== "object") {
+    return { competitors: [] };
+  }
+  const competitors = Array.isArray(result.competitors) ? result.competitors : [];
+  return {
+    competitors: competitors.filter((c) => c && typeof c === "object" && typeof c.name === "string" && c.name.trim()),
+  };
+}
+
 app.post("/api/investigate/async", async (req, res) => {
   try {
     assertRuntimeEnvReady();
@@ -598,31 +624,35 @@ app.post("/api/investigate/async", async (req, res) => {
     const goals = getFastAsyncGoals(targetUrl, domain);
     const tinyfish = new TinyFishWebAgentClient(config.tinyfish);
 
-    const [infraRun, buildRun, buyerRun, riskRun] = await Promise.allSettled([
+    const [infraRun, buildRun, buyerRun, riskRun, competitorsRun] = await Promise.allSettled([
       tinyfish.runAsync(goals.infra),
       tinyfish.runAsync(goals.build),
       tinyfish.runAsync(goals.buyer),
       tinyfish.runAsync(goals.risk),
+      tinyfish.runAsync(goals.competitors),
     ]);
 
     const infraRes = infraRun.status === "fulfilled" ? infraRun.value : { error: { message: infraRun.reason?.message || "infra run failed" } };
     const buildRes = buildRun.status === "fulfilled" ? buildRun.value : { error: { message: buildRun.reason?.message || "build run failed" } };
     const buyerRes = buyerRun.status === "fulfilled" ? buyerRun.value : { error: { message: buyerRun.reason?.message || "buyer run failed" } };
     const riskRes = riskRun.status === "fulfilled" ? riskRun.value : { error: { message: riskRun.reason?.message || "risk run failed" } };
+    const competitorsRes = competitorsRun.status === "fulfilled" ? competitorsRun.value : { error: { message: competitorsRun.reason?.message || "competitors run failed" } };
     const runIds = {
       infra: infraRes?.run_id ?? null,
       build: buildRes?.run_id ?? null,
       buyer: buyerRes?.run_id ?? null,
       risk: riskRes?.run_id ?? null,
+      competitors: competitorsRes?.run_id ?? null,
     };
     if (infraRes?.error?.message) runIds._infraError = infraRes.error.message;
     if (buildRes?.error?.message) runIds._buildError = buildRes.error.message;
     if (buyerRes?.error?.message) runIds._buyerError = buyerRes.error.message;
     if (riskRes?.error?.message) runIds._riskError = riskRes.error.message;
+    if (competitorsRes?.error?.message) runIds._competitorsError = competitorsRes.error.message;
     if (!runIds.infra && !runIds.build && !runIds.buyer && !runIds.risk) {
       return res.status(502).json({ error: "Failed to start async investigation runs.", runIds, domain, name });
     }
-    const partial = [runIds._infraError, runIds._buildError, runIds._buyerError, runIds._riskError].some(Boolean);
+    const partial = [runIds._infraError, runIds._buildError, runIds._buyerError, runIds._riskError, runIds._competitorsError].some(Boolean);
     res.status(partial ? 207 : 200).json({ runIds, domain, name, partial });
   } catch (error) {
     console.error("[CostLens] Async start error:", error);
@@ -646,11 +676,12 @@ app.post("/api/investigate/async/poll", async (req, res) => {
       }
     };
 
-    const [infraRun, buildRun, buyerRun, riskRun] = await Promise.all([
+    const [infraRun, buildRun, buyerRun, riskRun, competitorsRun] = await Promise.all([
       safeGetRun(runIds.infra),
       safeGetRun(runIds.build),
       safeGetRun(runIds.buyer),
       safeGetRun(runIds.risk),
+      safeGetRun(runIds.competitors),
     ]);
 
     const statuses = {
@@ -658,6 +689,7 @@ app.post("/api/investigate/async/poll", async (req, res) => {
       build: buildRun?.status ?? "FAILED",
       buyer: buyerRun?.status ?? "FAILED",
       risk: riskRun?.status ?? "FAILED",
+      competitors: competitorsRun?.status ?? "FAILED",
     };
     const running = ["PENDING", "RUNNING"].some((s) => Object.values(statuses).includes(s));
     if (running) {
@@ -668,26 +700,30 @@ app.post("/api/investigate/async/poll", async (req, res) => {
     const buildRaw = coerceRunResultToBuild(buildRun?.result);
     const buyerRaw = coerceRunResultToBuyer(buyerRun?.result);
     const riskRaw = coerceRunResultToRisk(riskRun?.result);
+    const competitorsRaw = coerceRunResultToCompetitors(competitorsRun?.result);
 
     const modeler = new CostModeler(config.openai);
     const report = await modeler.analyze(infraRaw, buildRaw, buyerRaw, { name, url: domain });
 
-    // Generate executive summary, negotiation playbook, and risk profile
+    // Generate executive summary, negotiation playbook, risk profile, and competitor analysis
     const targetInfo = { name, url: domain };
-    const [execSummaryRes, negotiationRes, riskProfileRes] = await Promise.allSettled([
+    const [execSummaryRes, negotiationRes, riskProfileRes, competitorAnalysisRes] = await Promise.allSettled([
       modeler.generateExecutiveSummary(report.infraCost, report.buildCost, report.buyerCost, targetInfo),
       modeler.generateNegotiationPlaybook(report.infraCost, report.buyerCost, targetInfo),
       modeler.analyzeRiskProfile(riskRaw, targetInfo),
+      modeler.generateCompetitorAnalysis(competitorsRaw, report.buyerCost, targetInfo),
     ]);
     const executiveSummary = execSummaryRes.status === "fulfilled" ? execSummaryRes.value : null;
     const negotiation = negotiationRes.status === "fulfilled" ? negotiationRes.value : null;
     const riskProfile = riskProfileRes.status === "fulfilled" ? riskProfileRes.value : modeler.getDefaultRiskProfile();
+    const competitorAnalysis = competitorAnalysisRes.status === "fulfilled" ? competitorAnalysisRes.value : null;
 
     const scannerErrors = {
       infra: infraRun?.status === "COMPLETED" ? null : infraRun?.error?.message ?? "Run failed",
       build: buildRun?.status === "COMPLETED" ? null : buildRun?.error?.message ?? "Run failed",
       buyer: buyerRun?.status === "COMPLETED" ? null : buyerRun?.error?.message ?? "Run failed",
       risk: riskRun?.status === "COMPLETED" ? null : riskRun?.error?.message ?? "Run failed",
+      competitors: competitorsRun?.status === "COMPLETED" ? null : competitorsRun?.error?.message ?? "Run failed",
     };
     const failedPillars = Object.entries(scannerErrors).filter(([, v]) => Boolean(v)).map(([k]) => k);
     const modelErrors = report?.quality?.modelErrors || {};
@@ -701,6 +737,7 @@ app.post("/api/investigate/async/poll", async (req, res) => {
       build: normalizePillarMeta(buildRaw, "build"),
       buyer: normalizePillarMeta(buyerRaw, "buyer"),
       risk: normalizePillarMeta(riskRaw, "risk"),
+      competitors: normalizePillarMeta(competitorsRaw, "competitors"),
     };
     const qualityMeta = buildQualityMeta({
       scannerErrors,
@@ -711,7 +748,7 @@ app.post("/api/investigate/async/poll", async (req, res) => {
       timedOut: false,
       fastMode: true,
     });
-    const totalPillars = 4;
+    const totalPillars = 5;
   const legacyCompleteness = Math.max(0, Math.round(((totalPillars - Math.min(totalPillars, degradedPillars.length)) / totalPillars) * 100));
 
     res.json({
@@ -724,6 +761,7 @@ app.post("/api/investigate/async/poll", async (req, res) => {
         executiveSummary: executiveSummary || null,
         negotiation: negotiation || null,
         riskProfile: riskProfile || modeler.getDefaultRiskProfile(),
+        competitorAnalysis: competitorAnalysis || null,
         infraCost: {
           ...report.infraCost,
           confidence: {
@@ -761,6 +799,10 @@ app.post("/api/investigate/async/poll", async (req, res) => {
           risk: {
             evidenceSources: [],
             extractedAt: pillarMeta.risk.extractedAt,
+          },
+          competitors: {
+            evidenceSources: [],
+            extractedAt: pillarMeta.competitors.extractedAt,
           },
         },
         quality: {

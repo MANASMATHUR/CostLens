@@ -42,6 +42,7 @@ export function normalizeReport(results) {
     },
     executiveSummary: null,
     negotiation: null,
+    competitorAnalysis: null,
     riskProfile: {
       overallRiskLevel: "medium",
       securityScore: 0,
@@ -55,13 +56,14 @@ export function normalizeReport(results) {
       build: { evidenceSources: [], extractedAt: null },
       buyer: { evidenceSources: [], extractedAt: null },
       risk: { evidenceSources: [], extractedAt: null },
+      competitors: { evidenceSources: [], extractedAt: null },
     },
     quality: {
       partialData: false,
       degradedPillars: [],
-      scannerErrors: { infra: null, build: null, buyer: null, risk: null },
-      modelErrors: { infra: null, build: null, buyer: null, risk: null },
-      modelWarnings: { infra: [], build: [], buyer: [], risk: [] },
+      scannerErrors: { infra: null, build: null, buyer: null, risk: null, competitors: null },
+      modelErrors: { infra: null, build: null, buyer: null, risk: null, competitors: null },
+      modelWarnings: { infra: [], build: [], buyer: [], risk: [], competitors: [] },
       anomalies: [],
       completenessScore: 100,
       qualityMeta: {
@@ -70,26 +72,30 @@ export function normalizeReport(results) {
           build: { tasksSucceeded: 0, tasksExpected: 0 },
           buyer: { tasksSucceeded: 0, tasksExpected: 0 },
           risk: { tasksSucceeded: 0, tasksExpected: 0 },
+          competitors: { tasksSucceeded: 0, tasksExpected: 0 },
         },
         sourceCoverage: {
           infra: { sourceFamilies: [], sourceCount: 0, expectedSources: 0 },
           build: { sourceFamilies: [], sourceCount: 0, expectedSources: 0 },
           buyer: { sourceFamilies: [], sourceCount: 0, expectedSources: 0 },
           risk: { sourceFamilies: [], sourceCount: 0, expectedSources: 0 },
+          competitors: { sourceFamilies: [], sourceCount: 0, expectedSources: 0 },
         },
         dataFreshness: {
           infra: { extractedAt: null, freshness: "unknown" },
           build: { extractedAt: null, freshness: "unknown" },
           buyer: { extractedAt: null, freshness: "unknown" },
           risk: { extractedAt: null, freshness: "unknown" },
+          competitors: { extractedAt: null, freshness: "unknown" },
         },
         crossChecks: [],
-        confidenceScore: { infra: 0, build: 0, buyer: 0, risk: 0, global: 0, level: "low" },
+        confidenceScore: { infra: 0, build: 0, buyer: 0, risk: 0, competitors: 0, global: 0, level: "low" },
         perPillar: {
           infra: { score: 0, level: "low", scoreComponents: { coverageScore: 0, reliabilityScore: 0, warningCount: 0, scannerFailed: false, modelFailed: false } },
           build: { score: 0, level: "low", scoreComponents: { coverageScore: 0, reliabilityScore: 0, warningCount: 0, scannerFailed: false, modelFailed: false } },
           buyer: { score: 0, level: "low", scoreComponents: { coverageScore: 0, reliabilityScore: 0, warningCount: 0, scannerFailed: false, modelFailed: false } },
           risk: { score: 0, level: "low", scoreComponents: { coverageScore: 0, reliabilityScore: 0, warningCount: 0, scannerFailed: false, modelFailed: false } },
+          competitors: { score: 0, level: "low", scoreComponents: { coverageScore: 0, reliabilityScore: 0, warningCount: 0, scannerFailed: false, modelFailed: false } },
         },
       },
     },
@@ -271,6 +277,30 @@ export function normalizeReport(results) {
       },
       recommendations: Array.isArray(results?.riskProfile?.recommendations) ? results.riskProfile.recommendations.map((x) => toText(x)) : [],
     },
+    competitorAnalysis: results?.competitorAnalysis
+      ? {
+          landscape: toText(results.competitorAnalysis.landscape, ""),
+          competitors: Array.isArray(results.competitorAnalysis.competitors)
+            ? results.competitorAnalysis.competitors.map((c) => ({
+                name: toText(c?.name, "Unknown"),
+                url: toText(c?.url, ""),
+                description: toText(c?.description, ""),
+                startingPrice: toText(c?.startingPrice, "Unknown"),
+                positioning: {
+                  priceLevel: toNum(c?.positioning?.priceLevel, 3),
+                  featureRichness: toNum(c?.positioning?.featureRichness, 3),
+                },
+                prosVsTarget: Array.isArray(c?.prosVsTarget) ? c.prosVsTarget.map((x) => toText(x)) : [],
+                consVsTarget: Array.isArray(c?.consVsTarget) ? c.consVsTarget.map((x) => toText(x)) : [],
+              }))
+            : [],
+          targetPositioning: {
+            priceLevel: toNum(results.competitorAnalysis.targetPositioning?.priceLevel, 3),
+            featureRichness: toNum(results.competitorAnalysis.targetPositioning?.featureRichness, 3),
+          },
+          verdict: toText(results.competitorAnalysis.verdict, ""),
+        }
+      : null,
     provenance: {
       infra: {
         evidenceSources: Array.isArray(results?.provenance?.infra?.evidenceSources) ? results.provenance.infra.evidenceSources.map((x) => toText(x)) : [],
@@ -288,6 +318,10 @@ export function normalizeReport(results) {
         evidenceSources: Array.isArray(results?.provenance?.risk?.evidenceSources) ? results.provenance.risk.evidenceSources.map((x) => toText(x)) : [],
         extractedAt: results?.provenance?.risk?.extractedAt || null,
       },
+      competitors: {
+        evidenceSources: Array.isArray(results?.provenance?.competitors?.evidenceSources) ? results.provenance.competitors.evidenceSources.map((x) => toText(x)) : [],
+        extractedAt: results?.provenance?.competitors?.extractedAt || null,
+      },
     },
     quality: {
       partialData: Boolean(results?.quality?.partialData),
@@ -297,18 +331,21 @@ export function normalizeReport(results) {
         build: results?.quality?.scannerErrors?.build || null,
         buyer: results?.quality?.scannerErrors?.buyer || null,
         risk: results?.quality?.scannerErrors?.risk || null,
+        competitors: results?.quality?.scannerErrors?.competitors || null,
       },
       modelErrors: {
         infra: results?.quality?.modelErrors?.infra || null,
         build: results?.quality?.modelErrors?.build || null,
         buyer: results?.quality?.modelErrors?.buyer || null,
         risk: results?.quality?.modelErrors?.risk || null,
+        competitors: results?.quality?.modelErrors?.competitors || null,
       },
       modelWarnings: {
         infra: Array.isArray(results?.quality?.modelWarnings?.infra) ? results.quality.modelWarnings.infra : [],
         build: Array.isArray(results?.quality?.modelWarnings?.build) ? results.quality.modelWarnings.build : [],
         buyer: Array.isArray(results?.quality?.modelWarnings?.buyer) ? results.quality.modelWarnings.buyer : [],
         risk: Array.isArray(results?.quality?.modelWarnings?.risk) ? results.quality.modelWarnings.risk : [],
+        competitors: Array.isArray(results?.quality?.modelWarnings?.competitors) ? results.quality.modelWarnings.competitors : [],
       },
       anomalies: Array.isArray(results?.quality?.anomalies) ? results.quality.anomalies : [],
       completenessScore: toNum(results?.quality?.completenessScore, 100),
@@ -329,6 +366,10 @@ export function normalizeReport(results) {
           risk: {
             tasksSucceeded: toNum(results?.quality?.qualityMeta?.pillarCoverage?.risk?.tasksSucceeded),
             tasksExpected: toNum(results?.quality?.qualityMeta?.pillarCoverage?.risk?.tasksExpected),
+          },
+          competitors: {
+            tasksSucceeded: toNum(results?.quality?.qualityMeta?.pillarCoverage?.competitors?.tasksSucceeded),
+            tasksExpected: toNum(results?.quality?.qualityMeta?.pillarCoverage?.competitors?.tasksExpected),
           },
         },
         sourceCoverage: {
@@ -360,6 +401,13 @@ export function normalizeReport(results) {
             sourceCount: toNum(results?.quality?.qualityMeta?.sourceCoverage?.risk?.sourceCount),
             expectedSources: toNum(results?.quality?.qualityMeta?.sourceCoverage?.risk?.expectedSources),
           },
+          competitors: {
+            sourceFamilies: Array.isArray(results?.quality?.qualityMeta?.sourceCoverage?.competitors?.sourceFamilies)
+              ? results.quality.qualityMeta.sourceCoverage.competitors.sourceFamilies
+              : [],
+            sourceCount: toNum(results?.quality?.qualityMeta?.sourceCoverage?.competitors?.sourceCount),
+            expectedSources: toNum(results?.quality?.qualityMeta?.sourceCoverage?.competitors?.expectedSources),
+          },
         },
         dataFreshness: {
           infra: {
@@ -378,6 +426,10 @@ export function normalizeReport(results) {
             extractedAt: results?.quality?.qualityMeta?.dataFreshness?.risk?.extractedAt || null,
             freshness: toText(results?.quality?.qualityMeta?.dataFreshness?.risk?.freshness, "unknown"),
           },
+          competitors: {
+            extractedAt: results?.quality?.qualityMeta?.dataFreshness?.competitors?.extractedAt || null,
+            freshness: toText(results?.quality?.qualityMeta?.dataFreshness?.competitors?.freshness, "unknown"),
+          },
         },
         crossChecks: Array.isArray(results?.quality?.qualityMeta?.crossChecks) ? results.quality.qualityMeta.crossChecks : [],
         confidenceScore: {
@@ -385,6 +437,7 @@ export function normalizeReport(results) {
           build: toNum(results?.quality?.qualityMeta?.confidenceScore?.build),
           buyer: toNum(results?.quality?.qualityMeta?.confidenceScore?.buyer),
           risk: toNum(results?.quality?.qualityMeta?.confidenceScore?.risk),
+          competitors: toNum(results?.quality?.qualityMeta?.confidenceScore?.competitors),
           global: toNum(results?.quality?.qualityMeta?.confidenceScore?.global),
           level: toText(results?.quality?.qualityMeta?.confidenceScore?.level, "low"),
         },
@@ -431,6 +484,17 @@ export function normalizeReport(results) {
               warningCount: toNum(results?.quality?.qualityMeta?.perPillar?.risk?.scoreComponents?.warningCount),
               scannerFailed: Boolean(results?.quality?.qualityMeta?.perPillar?.risk?.scoreComponents?.scannerFailed),
               modelFailed: Boolean(results?.quality?.qualityMeta?.perPillar?.risk?.scoreComponents?.modelFailed),
+            },
+          },
+          competitors: {
+            score: toNum(results?.quality?.qualityMeta?.perPillar?.competitors?.score),
+            level: toText(results?.quality?.qualityMeta?.perPillar?.competitors?.level, "low"),
+            scoreComponents: {
+              coverageScore: toNum(results?.quality?.qualityMeta?.perPillar?.competitors?.scoreComponents?.coverageScore),
+              reliabilityScore: toNum(results?.quality?.qualityMeta?.perPillar?.competitors?.scoreComponents?.reliabilityScore),
+              warningCount: toNum(results?.quality?.qualityMeta?.perPillar?.competitors?.scoreComponents?.warningCount),
+              scannerFailed: Boolean(results?.quality?.qualityMeta?.perPillar?.competitors?.scoreComponents?.scannerFailed),
+              modelFailed: Boolean(results?.quality?.qualityMeta?.perPillar?.competitors?.scoreComponents?.modelFailed),
             },
           },
         },

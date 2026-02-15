@@ -4,8 +4,10 @@ import { DegradedBanner } from "../components/ui/DegradedBanner";
 import { WhyHint } from "../components/ui/WhyHint";
 import { ExpandableRow } from "../components/ui/ExpandableRow";
 import { ConfBadge, ComplexBadge } from "../components/Badges";
-import { fmt, fmtRange } from "../utils/formatting";
+import { fmt, fmtRange, hasRange, hasValue } from "../utils/formatting";
 import { colors, space, type } from "../styles/tokens";
+
+const NO_DATA = "Insufficient data for this estimate";
 
 export function BuildView({ report, degraded, degradedReason, expandedBuild, setExpandedBuild }) {
   const confidenceLevel = report.buildCost?.confidence?.level || "low";
@@ -16,10 +18,15 @@ export function BuildView({ report, degraded, degradedReason, expandedBuild, set
     `Sources: ${provenance.evidenceSources?.length > 0 ? provenance.evidenceSources.join(", ") : "none"}`,
     `Validation warnings: ${report.buildCost.validationWarnings?.length || 0}`,
   ];
+
+  const hasCostData = hasRange(report.buildCost.totalEstimate);
+  const hasTimeData = hasRange(report.buildCost.timeEstimate);
+  const hasTeamData = hasValue(report.buildCost.teamSize?.min) || hasValue(report.buildCost.teamSize?.max) || hasValue(report.buildCost.teamSize?.optimal);
+
   const cards = [
-    { label: "Total Build Cost", value: fmtRange(report.buildCost.totalEstimate.low, report.buildCost.totalEstimate.high), sub: `Mid: ${fmt(report.buildCost.totalEstimate.mid)} (estimated)` },
-    { label: "Timeline", value: `${report.buildCost.timeEstimate.low}–${report.buildCost.timeEstimate.high} months`, sub: `Optimal: ${report.buildCost.timeEstimate.mid} months (estimated)` },
-    { label: "Team Size", value: `${report.buildCost.teamSize.min}–${report.buildCost.teamSize.max} engineers`, sub: `Optimal: ${report.buildCost.teamSize.optimal} (estimated)` },
+    { label: "Total Build Cost", hasData: hasCostData, value: fmtRange(report.buildCost.totalEstimate.low, report.buildCost.totalEstimate.high), sub: `Mid: ${fmt(report.buildCost.totalEstimate.mid)} (estimated)` },
+    { label: "Timeline", hasData: hasTimeData, value: `${report.buildCost.timeEstimate.low}–${report.buildCost.timeEstimate.high} months`, sub: `Optimal: ${report.buildCost.timeEstimate.mid} months (estimated)` },
+    { label: "Team Size", hasData: hasTeamData, value: `${report.buildCost.teamSize.min}–${report.buildCost.teamSize.max} engineers`, sub: `Optimal: ${report.buildCost.teamSize.optimal} (estimated)` },
   ];
 
   return (
@@ -34,10 +41,16 @@ export function BuildView({ report, degraded, degradedReason, expandedBuild, set
                 <SectionLabel style={{ marginBottom: 0 }}>{c.label}</SectionLabel>
                 <WhyHint lines={buildHintLines} />
               </div>
-              <ConfBadge level={confidenceLevel} />
+              {c.hasData && <ConfBadge level={confidenceLevel} />}
             </div>
-            <div style={{ fontFamily: "'Playfair Display',serif", fontWeight: 900, fontSize: 22, color: colors.accent, lineHeight: 1 }}>{c.value}</div>
-            <div style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: type.sizeSm, color: colors.textMuted, marginTop: 4 }}>{c.sub}</div>
+            {c.hasData ? (
+              <>
+                <div style={{ fontFamily: "'Playfair Display',serif", fontWeight: 900, fontSize: 22, color: colors.accent, lineHeight: 1 }}>{c.value}</div>
+                <div style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: type.sizeSm, color: colors.textMuted, marginTop: 4 }}>{c.sub}</div>
+              </>
+            ) : (
+              <div style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: type.sizeSm, color: colors.textMuted }}>{NO_DATA}</div>
+            )}
           </Panel>
         ))}
       </div>

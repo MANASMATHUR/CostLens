@@ -535,6 +535,197 @@ Competitor Insights: ${JSON.stringify(data?.competitors || [])}`,
     return typeof value === "string" && value.trim().length > 0 ? value : fallback;
   }
 
+  // ── Feature 1: Executive Summary ────────────────────────────
+  async generateExecutiveSummary(infraCost, buildCost, buyerCost, targetInfo) {
+    try {
+      const parsed = await this.requestJsonWithRetry({
+        messages: [
+          {
+            role: "system",
+            content: `You are an executive SaaS analyst. Given three cost pillars for a SaaS product, produce a concise executive summary.
+Return strict JSON only:
+{
+  "summary": "1-2 paragraph plain-English overview of the product's cost profile, margins, build complexity, and buyer value.",
+  "keyFindings": ["string (3-5 key findings from the analysis)"],
+  "recommendations": [{ "title": "string", "detail": "string", "priority": "high"|"medium"|"low" }],
+  "verdictLabel": "string (one of: Strong Value, Fair Market, Overpriced, Insufficient Data)"
+}
+Be factual. If data is sparse, set verdictLabel to "Insufficient Data" and note limitations in recommendations.`,
+          },
+          {
+            role: "user",
+            content: `Executive summary for ${targetInfo.name} (${targetInfo.url}):
+Infrastructure Cost: ${JSON.stringify(infraCost || {})}
+Build Cost: ${JSON.stringify(buildCost || {})}
+Buyer Cost: ${JSON.stringify(buyerCost || {})}`,
+          },
+        ],
+        maxTokens: 1500,
+      });
+      return this.normalizeExecutiveSummary(parsed);
+    } catch (error) {
+      console.error("[CostLens] Executive summary generation failed:", error);
+      return null;
+    }
+  }
+
+  normalizeExecutiveSummary(value) {
+    const input = this.asObject(value);
+    const summary = this.asString(input.summary, "");
+    if (!summary) return null;
+    return {
+      summary,
+      keyFindings: Array.isArray(input.keyFindings)
+        ? input.keyFindings.map((x) => this.asString(x)).filter(Boolean)
+        : [],
+      recommendations: Array.isArray(input.recommendations)
+        ? input.recommendations.map((r) => ({
+            title: this.asString(r?.title, "Recommendation"),
+            detail: this.asString(r?.detail, ""),
+            priority: ["high", "medium", "low"].includes(r?.priority) ? r.priority : "medium",
+          })).filter((r) => r.detail)
+        : [],
+      verdictLabel: this.asString(input.verdictLabel, "Insufficient Data"),
+    };
+  }
+
+  // ── Feature 2: Negotiation Playbook ───────────────────────
+  async generateNegotiationPlaybook(infraCost, buyerCost, targetInfo) {
+    try {
+      const parsed = await this.requestJsonWithRetry({
+        messages: [
+          {
+            role: "system",
+            content: `You are a SaaS procurement negotiation expert. Given a vendor's estimated infrastructure costs (their margins) and buyer pricing data, generate a negotiation playbook.
+Return strict JSON only:
+{
+  "leverageFactors": [{ "factor": "string", "explanation": "string" }],
+  "talkingPoints": ["string"],
+  "counterOffers": [{ "plan": "string", "currentPrice": "string", "suggestedTarget": "string", "rationale": "string" }],
+  "riskWarnings": ["string"]
+}
+Base suggestions on data. If margin or pricing data is sparse, say so in riskWarnings and be conservative.`,
+          },
+          {
+            role: "user",
+            content: `Negotiation playbook for ${targetInfo.name} (${targetInfo.url}):
+Vendor Infra Costs & Margins: ${JSON.stringify(infraCost || {})}
+Buyer Pricing & Plans: ${JSON.stringify(buyerCost || {})}`,
+          },
+        ],
+        maxTokens: 1500,
+      });
+      return this.normalizeNegotiationPlaybook(parsed);
+    } catch (error) {
+      console.error("[CostLens] Negotiation playbook generation failed:", error);
+      return null;
+    }
+  }
+
+  normalizeNegotiationPlaybook(value) {
+    const input = this.asObject(value);
+    const leverageFactors = Array.isArray(input.leverageFactors)
+      ? input.leverageFactors.map((f) => ({
+          factor: this.asString(f?.factor, ""),
+          explanation: this.asString(f?.explanation, ""),
+        })).filter((f) => f.factor && f.explanation)
+      : [];
+    const talkingPoints = Array.isArray(input.talkingPoints)
+      ? input.talkingPoints.map((x) => this.asString(x)).filter(Boolean)
+      : [];
+    if (leverageFactors.length === 0 && talkingPoints.length === 0) return null;
+    return {
+      leverageFactors,
+      talkingPoints,
+      counterOffers: Array.isArray(input.counterOffers)
+        ? input.counterOffers.map((c) => ({
+            plan: this.asString(c?.plan, "Unknown"),
+            currentPrice: this.asString(c?.currentPrice, "Unknown"),
+            suggestedTarget: this.asString(c?.suggestedTarget, "Unknown"),
+            rationale: this.asString(c?.rationale, ""),
+          })).filter((c) => c.rationale)
+        : [],
+      riskWarnings: Array.isArray(input.riskWarnings)
+        ? input.riskWarnings.map((x) => this.asString(x)).filter(Boolean)
+        : [],
+    };
+  }
+
+  // ── Feature 3: Risk Profile Analysis ──────────────────────
+  async analyzeRiskProfile(riskData, targetInfo) {
+    try {
+      const parsed = await this.requestJsonWithRetry({
+        messages: [
+          {
+            role: "system",
+            content: `You are a cybersecurity and compliance analyst. Given security, privacy, and tracker signals from a SaaS product, generate a risk/compliance profile.
+Return strict JSON only:
+{
+  "overallRiskLevel": "low"|"medium"|"high"|"critical",
+  "securityScore": number (0-100),
+  "complianceBadges": [{ "name": "string", "status": "verified"|"claimed"|"missing" }],
+  "findings": [{ "category": "string", "severity": "info"|"warning"|"critical", "detail": "string" }],
+  "trackerSummary": { "total": number, "categories": {} },
+  "recommendations": ["string"]
+}
+If signals are sparse, set overallRiskLevel to "medium" and note data gaps in findings.`,
+          },
+          {
+            role: "user",
+            content: `Risk profile for ${targetInfo.name} (${targetInfo.url}):
+Security Headers: ${JSON.stringify(riskData?.securityHeaders || {})}
+Privacy & Compliance: ${JSON.stringify(riskData?.privacyCompliance || {})}
+Third-Party Trackers: ${JSON.stringify(riskData?.trackers || [])}`,
+          },
+        ],
+        maxTokens: 1500,
+      });
+      return this.normalizeRiskProfile(parsed);
+    } catch (error) {
+      console.error("[CostLens] Risk profile analysis failed:", error);
+      return this.getDefaultRiskProfile();
+    }
+  }
+
+  normalizeRiskProfile(value) {
+    const input = this.asObject(value);
+    return {
+      overallRiskLevel: ["low", "medium", "high", "critical"].includes(input.overallRiskLevel) ? input.overallRiskLevel : "medium",
+      securityScore: Math.max(0, Math.min(100, this.asNumber(input.securityScore, 50))),
+      complianceBadges: Array.isArray(input.complianceBadges)
+        ? input.complianceBadges.map((b) => ({
+            name: this.asString(b?.name, "Unknown"),
+            status: ["verified", "claimed", "missing"].includes(b?.status) ? b.status : "missing",
+          }))
+        : [],
+      findings: Array.isArray(input.findings)
+        ? input.findings.map((f) => ({
+            category: this.asString(f?.category, "General"),
+            severity: ["info", "warning", "critical"].includes(f?.severity) ? f.severity : "info",
+            detail: this.asString(f?.detail, ""),
+          })).filter((f) => f.detail)
+        : [],
+      trackerSummary: {
+        total: this.asNumber(input.trackerSummary?.total, 0),
+        categories: this.asObject(input.trackerSummary?.categories),
+      },
+      recommendations: Array.isArray(input.recommendations)
+        ? input.recommendations.map((x) => this.asString(x)).filter(Boolean)
+        : [],
+    };
+  }
+
+  getDefaultRiskProfile() {
+    return {
+      overallRiskLevel: "medium",
+      securityScore: 0,
+      complianceBadges: [],
+      findings: [{ category: "Data Quality", severity: "info", detail: "Risk scan data was insufficient for a full profile." }],
+      trackerSummary: { total: 0, categories: {} },
+      recommendations: ["Re-run with a full scan for more comprehensive risk analysis."],
+    };
+  }
+
   errorMessage(error) {
     if (!error) return "Unknown model error";
     if (typeof error === "string") return error;

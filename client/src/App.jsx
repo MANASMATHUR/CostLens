@@ -7,10 +7,14 @@ import { ReportSummary } from "./components/ReportSummary";
 import { InfraView } from "./views/InfraView";
 import { BuildView } from "./views/BuildView";
 import { BuyerView } from "./views/BuyerView";
+import { RiskView } from "./views/RiskView";
+import { ExecutiveSummary } from "./components/ExecutiveSummary";
+import { ExportBar } from "./components/ExportBar";
+import { saveReport, loadReport } from "./utils/history";
 import { colors, space } from "./styles/tokens";
 
 export default function App() {
-  const [view, setView] = useState(null); // null = landing, "infra" | "build" | "buyer"
+  const [view, setView] = useState(null); // null = landing, "infra" | "build" | "buyer" | "risk"
   const [results, setResults] = useState(null);
   const [scanning, setScanning] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -126,15 +130,16 @@ export default function App() {
           setProgress(100);
           setAction("Investigation complete");
           setResults(data.report);
+          saveReport(data.report);
           setView("infra");
           setScanning(false);
           return;
         }
         const runs = data.runs || {};
-        const done = [runs.infra, runs.build, runs.buyer].filter((s) => s === "COMPLETED" || s === "FAILED").length;
-        lastProgress = 20 + Math.round((done / 3) * 60);
+        const done = [runs.infra, runs.build, runs.buyer, runs.risk].filter((s) => s === "COMPLETED" || s === "FAILED").length;
+        lastProgress = 20 + Math.round((done / 4) * 60);
         setProgress(lastProgress);
-        setAction(`Waiting for scans... (${done}/3 done)`);
+        setAction(`Waiting for scans... (${done}/4 done)`);
       }
       throw new Error("Investigation took too long. Try again or use a simpler URL.");
     } catch (err) {
@@ -144,6 +149,15 @@ export default function App() {
     }
   }, [fetchJsonWithTimeout, scanning, url]);
 
+  const handleLoadReport = useCallback((id) => {
+    const report = loadReport(id);
+    if (report) {
+      setResults(report);
+      setView("infra");
+      setScanError("");
+    }
+  }, []);
+
   const hasResults = Boolean(results);
   const R = normalizeReport(results);
   const degradedSet = new Set(R.quality.degradedPillars || []);
@@ -151,6 +165,7 @@ export default function App() {
     ["infra", "Their Cost"],
     ["build", "Build Cost"],
     ["buyer", "Your Cost"],
+    ["risk", "Risk"],
   ];
   const degradedReason = (pillar) => {
     const scanner = R.quality?.scannerErrors?.[pillar];
@@ -182,12 +197,15 @@ export default function App() {
             scanning={scanning}
             scanError={scanError}
             onClearError={() => setScanError("")}
+            onLoadReport={handleLoadReport}
           />
         )}
 
         {hasResults && (
           <div style={{ display: "flex", flexDirection: "column", gap: space.lg }}>
+            <ExportBar report={R} />
             <ReportSummary report={R} activePillar={view || "infra"} />
+            <ExecutiveSummary executiveSummary={R.executiveSummary} />
             {view === "infra" && (
               <section role="tabpanel" id="panel-infra" aria-labelledby="tab-infra">
                 <InfraView
@@ -213,6 +231,11 @@ export default function App() {
             {view === "buyer" && (
               <section role="tabpanel" id="panel-buyer" aria-labelledby="tab-buyer">
                 <BuyerView report={R} degraded={degradedSet.has("buyer")} degradedReason={degradedReason} />
+              </section>
+            )}
+            {view === "risk" && (
+              <section role="tabpanel" id="panel-risk" aria-labelledby="tab-risk">
+                <RiskView report={R} degraded={degradedSet.has("risk")} degradedReason={degradedReason} />
               </section>
             )}
           </div>

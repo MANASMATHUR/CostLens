@@ -1,13 +1,13 @@
 import { Panel } from "./ui/Panel";
 import { SectionLabel } from "./ui/SectionLabel";
-import { fmt } from "../utils/formatting";
+import { fmt, hasValue, hasRange } from "../utils/formatting";
 import { colors, space, type } from "../styles/tokens";
 
 export function ReportSummary({ report, activePillar = "infra" }) {
-  const pillar = ["infra", "build", "buyer"].includes(activePillar) ? activePillar : "infra";
-  const checklistPillars = ["infra", "build", "buyer"];
+  const pillar = ["infra", "build", "buyer", "risk"].includes(activePillar) ? activePillar : "infra";
+  const checklistPillars = ["infra", "build", "buyer", "risk"];
   const visiblePillars = [pillar];
-  const pillarLabel = pillar === "infra" ? "Their Cost" : pillar === "build" ? "Build Cost" : "Your Cost";
+  const pillarLabel = pillar === "infra" ? "Their Cost" : pillar === "build" ? "Build Cost" : pillar === "buyer" ? "Your Cost" : "Risk";
   const degradedCount = report.quality.degradedPillars.length;
   const legacyScore = report.quality.completenessScore;
   const weightedScore = report.quality.qualityMeta?.confidenceScore?.global || legacyScore;
@@ -29,7 +29,7 @@ export function ReportSummary({ report, activePillar = "infra" }) {
     const isMissing = hasError || (hasAnyData && (tasks.tasksSucceeded === 0 || sources.sourceCount === 0));
     return {
       pillar,
-      label: pillar === "infra" ? "Their Cost" : pillar === "build" ? "Build Cost" : "Your Cost",
+      label: pillar === "infra" ? "Their Cost" : pillar === "build" ? "Build Cost" : pillar === "buyer" ? "Your Cost" : "Risk",
       status: hasAnyData ? (isComplete ? "complete" : isMissing ? "missing" : "partial") : "unavailable",
       details: hasAnyData
         ? `${tasks.tasksSucceeded}/${tasks.tasksExpected} tasks, ${sources.sourceCount}/${sources.expectedSources} sources`
@@ -39,10 +39,12 @@ export function ReportSummary({ report, activePillar = "infra" }) {
   const crossChecks = Array.isArray(report.quality.qualityMeta?.crossChecks) ? report.quality.qualityMeta.crossChecks : [];
   const headlineText =
     pillar === "infra"
-      ? `Estimated Revenue Signal: ${fmt(report.infraCost.revenueEstimate)}/mo`
+      ? hasValue(report.infraCost.revenueEstimate) ? `Estimated Revenue Signal: ${fmt(report.infraCost.revenueEstimate)}/mo` : null
       : pillar === "build"
-        ? `Estimated Build Midpoint: ${fmt(report.buildCost.totalEstimate.mid)}`
-        : `Estimated Plans Analyzed: ${report.buyerCost.plans.length || 0}`;
+        ? hasRange(report.buildCost.totalEstimate) ? `Estimated Build Midpoint: ${fmt(report.buildCost.totalEstimate.mid)}` : null
+        : pillar === "buyer"
+          ? report.buyerCost.plans.length > 0 ? `Plans Analyzed: ${report.buyerCost.plans.length}` : null
+          : report.riskProfile?.securityScore > 0 ? `Security Score: ${report.riskProfile.securityScore}/100` : null;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: space.md }}>
@@ -129,9 +131,11 @@ export function ReportSummary({ report, activePillar = "infra" }) {
           <div style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: type.sizeMd, color: colors.textSecondary, lineHeight: 1.5 }}>
             {report.quality.degradedPillars.includes(pillar) ? `${pillarLabel} has degraded signals in this run.` : `${pillarLabel} has no degradation flags.`}
           </div>
-          <div style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: type.sizeSm, color: colors.textMuted, marginTop: 6 }}>
-            {headlineText}
-          </div>
+          {headlineText && (
+            <div style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: type.sizeSm, color: colors.textMuted, marginTop: 6 }}>
+              {headlineText}
+            </div>
+          )}
           {crossChecks.length > 0 && (
             <div style={{ marginTop: 8, fontFamily: "'IBM Plex Mono',monospace", fontSize: type.sizeSm, color: colors.accent }}>
               Cross-check alerts: {crossChecks.length}

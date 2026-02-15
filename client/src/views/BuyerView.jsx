@@ -2,6 +2,7 @@ import { Panel } from "../components/ui/Panel";
 import { SectionLabel } from "../components/ui/SectionLabel";
 import { DegradedBanner } from "../components/ui/DegradedBanner";
 import { WhyHint } from "../components/ui/WhyHint";
+import { NegotiationPlaybook } from "../components/NegotiationPlaybook";
 import { ConfBadge } from "../components/Badges";
 import { colors, space, type } from "../styles/tokens";
 
@@ -64,15 +65,17 @@ export function BuyerView({ report, degraded, degradedReason }) {
         )}
       </Panel>
 
-      <Panel style={{ display: "flex", alignItems: "center", gap: space.md, background: colors.accentSoft, borderColor: "#C41E3A25" }}>
-        <span style={{ fontSize: 22 }}>⚠️</span>
-        <div>
-          <div style={{ fontFamily: "'Playfair Display',serif", fontWeight: 700, fontSize: 15 }}>Listed pricing often understates the actual cost</div>
-          <div style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: type.sizeSm, color: colors.textSecondary }}>
-            Additional costs can increase {report.target.name}&apos;s listed price by 40-55% for typical teams.
+      {report.buyerCost.plans.length > 0 && (
+        <Panel style={{ display: "flex", alignItems: "center", gap: space.md, background: "#FFF8E8", borderColor: "#9A5B0033" }}>
+          <span style={{ fontSize: 22 }}>ℹ️</span>
+          <div>
+            <div style={{ fontFamily: "'Playfair Display',serif", fontWeight: 700, fontSize: 15 }}>Review plan details carefully</div>
+            <div style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: type.sizeSm, color: colors.textSecondary }}>
+              The analysis below is based on publicly available pricing data for {report.target.name}. Verify all figures with the vendor before making decisions.
+            </div>
           </div>
-        </div>
-      </Panel>
+        </Panel>
+      )}
 
       <div>
         <SectionLabel>Plan-by-Plan True Cost Analysis</SectionLabel>
@@ -148,6 +151,8 @@ export function BuyerView({ report, degraded, degradedReason }) {
           </div>
         ))}
       </Panel>
+
+      <NegotiationPlaybook negotiation={report.negotiation} />
     </div>
   );
 }

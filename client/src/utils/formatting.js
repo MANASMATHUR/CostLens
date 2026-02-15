@@ -16,3 +16,10 @@ export const toNum = (n, fallback = 0) => {
 export const toText = (value, fallback = "Unknown") => {
   return typeof value === "string" && value.trim().length > 0 ? value : fallback;
 };
+
+/** Returns true when a number is finite and non-zero. */
+export const hasValue = (n) => Number.isFinite(Number(n)) && Number(n) !== 0;
+
+/** Returns true when at least one of low/mid/high is non-zero. */
+export const hasRange = (obj) =>
+  hasValue(obj?.low) || hasValue(obj?.mid) || hasValue(obj?.high);

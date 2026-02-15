@@ -5,8 +5,10 @@ import { WhyHint } from "../components/ui/WhyHint";
 import { ExpandableRow } from "../components/ui/ExpandableRow";
 import { MarginGauge, CostBar } from "../components/InfraVisualizations";
 import { ConfBadge } from "../components/Badges";
-import { fmt, fmtRange } from "../utils/formatting";
+import { fmt, fmtRange, hasRange, hasValue } from "../utils/formatting";
 import { colors, space, type } from "../styles/tokens";
+
+const NO_DATA = "Insufficient data for this estimate";
 
 export function InfraView({ report, degraded, degradedReason, expandedInfra, setExpandedInfra }) {
   const items = report.infraCost.breakdown;
@@ -19,6 +21,10 @@ export function InfraView({ report, degraded, degradedReason, expandedInfra, set
     `Sources: ${provenance.evidenceSources?.length > 0 ? provenance.evidenceSources.join(", ") : "none"}`,
     `Validation warnings: ${report.infraCost.validationWarnings?.length || 0}`,
   ];
+
+  const hasMarginData = hasRange(report.infraCost.grossMargin);
+  const hasMonthlyCostData = hasRange(report.infraCost.monthlyEstimate);
+  const hasPerUserData = hasValue(report.infraCost.perUserEstimate?.low) || hasValue(report.infraCost.perUserEstimate?.high);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: space.lg, animation: "fadeUp 0.4s ease" }}>
@@ -33,7 +39,11 @@ export function InfraView({ report, degraded, degradedReason, expandedInfra, set
             </div>
             <ConfBadge level={confidenceLevel} />
           </div>
-          <MarginGauge {...report.infraCost.grossMargin} />
+          {hasMarginData ? (
+            <MarginGauge {...report.infraCost.grossMargin} />
+          ) : (
+            <div style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: type.sizeSm, color: colors.textMuted }}>{NO_DATA}</div>
+          )}
         </Panel>
         <Panel style={{ padding: 24 }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 12 }}>
@@ -41,19 +51,31 @@ export function InfraView({ report, degraded, degradedReason, expandedInfra, set
               <SectionLabel>Monthly Infrastructure Cost</SectionLabel>
               <WhyHint lines={infraHintLines} />
             </div>
-            <span style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: type.sizeXs, color: colors.textMuted }}>{confidenceScore}% confidence</span>
+            {hasMonthlyCostData && (
+              <span style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: type.sizeXs, color: colors.textMuted }}>{confidenceScore}% confidence</span>
+            )}
           </div>
-          <div style={{ fontFamily: "'Playfair Display',serif", fontWeight: 900, fontSize: 32, color: colors.accent, marginBottom: 4 }}>
-            {fmtRange(report.infraCost.monthlyEstimate.low, report.infraCost.monthlyEstimate.high)}
-          </div>
-          <div style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: type.sizeMd, color: colors.textSecondary, marginBottom: 12 }}>
-            Mid estimate: {fmt(report.infraCost.monthlyEstimate.mid)}/mo (estimated)
-          </div>
+          {hasMonthlyCostData ? (
+            <>
+              <div style={{ fontFamily: "'Playfair Display',serif", fontWeight: 900, fontSize: 32, color: colors.accent, marginBottom: 4 }}>
+                {fmtRange(report.infraCost.monthlyEstimate.low, report.infraCost.monthlyEstimate.high)}
+              </div>
+              <div style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: type.sizeMd, color: colors.textSecondary, marginBottom: 12 }}>
+                Mid estimate: {fmt(report.infraCost.monthlyEstimate.mid)}/mo (estimated)
+              </div>
+            </>
+          ) : (
+            <div style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: type.sizeSm, color: colors.textMuted, marginBottom: 12 }}>{NO_DATA}</div>
+          )}
           <SectionLabel style={{ marginBottom: 6 }}>Per-user Cost</SectionLabel>
-          <div style={{ fontFamily: "'Playfair Display',serif", fontWeight: 700, fontSize: 20 }}>
-            ${report.infraCost.perUserEstimate.low}–${report.infraCost.perUserEstimate.high}
-            <span style={{ fontSize: 13, color: colors.textMuted }}>/user/mo</span>
-          </div>
+          {hasPerUserData ? (
+            <div style={{ fontFamily: "'Playfair Display',serif", fontWeight: 700, fontSize: 20 }}>
+              ${report.infraCost.perUserEstimate.low}–${report.infraCost.perUserEstimate.high}
+              <span style={{ fontSize: 13, color: colors.textMuted }}>/user/mo</span>
+            </div>
+          ) : (
+            <div style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: type.sizeSm, color: colors.textMuted }}>{NO_DATA}</div>
+          )}
         </Panel>
       </div>
 

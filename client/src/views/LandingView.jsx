@@ -1,6 +1,7 @@
+import { ScanHistory } from "../components/ScanHistory";
 import { colors, radius, space, type } from "../styles/tokens";
 
-export function LandingView({ url, setUrl, runScan, scanning, scanError, onClearError }) {
+export function LandingView({ url, setUrl, runScan, scanning, scanError, onClearError, onLoadReport }) {
   return (
     <div style={{ maxWidth: 760, margin: "0 auto", padding: `${56}px ${28}px`, animation: "fadeUp 0.5s ease" }}>
       <div style={{ textAlign: "center", marginBottom: 40 }}>
@@ -110,6 +111,8 @@ export function LandingView({ url, setUrl, runScan, scanning, scanError, onClear
           </div>
         </div>
       )}
+
+      <ScanHistory onLoadReport={onLoadReport} />
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(180px,1fr))", gap: 12, marginTop: 40 }}>
         {[

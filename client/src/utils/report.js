@@ -40,17 +40,28 @@ export function normalizeReport(results) {
       confidence: { overall: 0, level: "low" },
       validationWarnings: [],
     },
+    executiveSummary: null,
+    negotiation: null,
+    riskProfile: {
+      overallRiskLevel: "medium",
+      securityScore: 0,
+      complianceBadges: [],
+      findings: [],
+      trackerSummary: { total: 0, categories: {} },
+      recommendations: [],
+    },
     provenance: {
       infra: { evidenceSources: [], extractedAt: null },
       build: { evidenceSources: [], extractedAt: null },
       buyer: { evidenceSources: [], extractedAt: null },
+      risk: { evidenceSources: [], extractedAt: null },
     },
     quality: {
       partialData: false,
       degradedPillars: [],
-      scannerErrors: { infra: null, build: null, buyer: null },
-      modelErrors: { infra: null, build: null, buyer: null },
-      modelWarnings: { infra: [], build: [], buyer: [] },
+      scannerErrors: { infra: null, build: null, buyer: null, risk: null },
+      modelErrors: { infra: null, build: null, buyer: null, risk: null },
+      modelWarnings: { infra: [], build: [], buyer: [], risk: [] },
       anomalies: [],
       completenessScore: 100,
       qualityMeta: {
@@ -58,23 +69,27 @@ export function normalizeReport(results) {
           infra: { tasksSucceeded: 0, tasksExpected: 0 },
           build: { tasksSucceeded: 0, tasksExpected: 0 },
           buyer: { tasksSucceeded: 0, tasksExpected: 0 },
+          risk: { tasksSucceeded: 0, tasksExpected: 0 },
         },
         sourceCoverage: {
           infra: { sourceFamilies: [], sourceCount: 0, expectedSources: 0 },
           build: { sourceFamilies: [], sourceCount: 0, expectedSources: 0 },
           buyer: { sourceFamilies: [], sourceCount: 0, expectedSources: 0 },
+          risk: { sourceFamilies: [], sourceCount: 0, expectedSources: 0 },
         },
         dataFreshness: {
           infra: { extractedAt: null, freshness: "unknown" },
           build: { extractedAt: null, freshness: "unknown" },
           buyer: { extractedAt: null, freshness: "unknown" },
+          risk: { extractedAt: null, freshness: "unknown" },
         },
         crossChecks: [],
-        confidenceScore: { infra: 0, build: 0, buyer: 0, global: 0, level: "low" },
+        confidenceScore: { infra: 0, build: 0, buyer: 0, risk: 0, global: 0, level: "low" },
         perPillar: {
           infra: { score: 0, level: "low", scoreComponents: { coverageScore: 0, reliabilityScore: 0, warningCount: 0, scannerFailed: false, modelFailed: false } },
           build: { score: 0, level: "low", scoreComponents: { coverageScore: 0, reliabilityScore: 0, warningCount: 0, scannerFailed: false, modelFailed: false } },
           buyer: { score: 0, level: "low", scoreComponents: { coverageScore: 0, reliabilityScore: 0, warningCount: 0, scannerFailed: false, modelFailed: false } },
+          risk: { score: 0, level: "low", scoreComponents: { coverageScore: 0, reliabilityScore: 0, warningCount: 0, scannerFailed: false, modelFailed: false } },
         },
       },
     },
@@ -198,6 +213,64 @@ export function normalizeReport(results) {
       confidence: normalizeConfidence(results?.buyerCost?.confidence),
       validationWarnings: Array.isArray(results?.buyerCost?.validationWarnings) ? results.buyerCost.validationWarnings.map((x) => toText(x)) : [],
     },
+    executiveSummary: results?.executiveSummary
+      ? {
+          summary: toText(results.executiveSummary.summary, ""),
+          keyFindings: Array.isArray(results.executiveSummary.keyFindings) ? results.executiveSummary.keyFindings.map((x) => toText(x)) : [],
+          recommendations: Array.isArray(results.executiveSummary.recommendations)
+            ? results.executiveSummary.recommendations.map((r) => ({
+                title: toText(r?.title, "Recommendation"),
+                detail: toText(r?.detail, ""),
+                priority: toText(r?.priority, "medium"),
+              }))
+            : [],
+          verdictLabel: toText(results.executiveSummary.verdictLabel, "Insufficient Data"),
+        }
+      : null,
+    negotiation: results?.negotiation
+      ? {
+          leverageFactors: Array.isArray(results.negotiation.leverageFactors)
+            ? results.negotiation.leverageFactors.map((f) => ({
+                factor: toText(f?.factor, ""),
+                explanation: toText(f?.explanation, ""),
+              }))
+            : [],
+          talkingPoints: Array.isArray(results.negotiation.talkingPoints) ? results.negotiation.talkingPoints.map((x) => toText(x)) : [],
+          counterOffers: Array.isArray(results.negotiation.counterOffers)
+            ? results.negotiation.counterOffers.map((c) => ({
+                plan: toText(c?.plan, "Unknown"),
+                currentPrice: toText(c?.currentPrice, "Unknown"),
+                suggestedTarget: toText(c?.suggestedTarget, "Unknown"),
+                rationale: toText(c?.rationale, ""),
+              }))
+            : [],
+          riskWarnings: Array.isArray(results.negotiation.riskWarnings) ? results.negotiation.riskWarnings.map((x) => toText(x)) : [],
+        }
+      : null,
+    riskProfile: {
+      overallRiskLevel: toText(results?.riskProfile?.overallRiskLevel, "medium"),
+      securityScore: toNum(results?.riskProfile?.securityScore, 0),
+      complianceBadges: Array.isArray(results?.riskProfile?.complianceBadges)
+        ? results.riskProfile.complianceBadges.map((b) => ({
+            name: toText(b?.name, "Unknown"),
+            status: toText(b?.status, "missing"),
+          }))
+        : [],
+      findings: Array.isArray(results?.riskProfile?.findings)
+        ? results.riskProfile.findings.map((f) => ({
+            category: toText(f?.category, "General"),
+            severity: toText(f?.severity, "info"),
+            detail: toText(f?.detail, ""),
+          }))
+        : [],
+      trackerSummary: {
+        total: toNum(results?.riskProfile?.trackerSummary?.total, 0),
+        categories: results?.riskProfile?.trackerSummary?.categories && typeof results.riskProfile.trackerSummary.categories === "object"
+          ? results.riskProfile.trackerSummary.categories
+          : {},
+      },
+      recommendations: Array.isArray(results?.riskProfile?.recommendations) ? results.riskProfile.recommendations.map((x) => toText(x)) : [],
+    },
     provenance: {
       infra: {
         evidenceSources: Array.isArray(results?.provenance?.infra?.evidenceSources) ? results.provenance.infra.evidenceSources.map((x) => toText(x)) : [],
@@ -211,6 +284,10 @@ export function normalizeReport(results) {
         evidenceSources: Array.isArray(results?.provenance?.buyer?.evidenceSources) ? results.provenance.buyer.evidenceSources.map((x) => toText(x)) : [],
         extractedAt: results?.provenance?.buyer?.extractedAt || null,
       },
+      risk: {
+        evidenceSources: Array.isArray(results?.provenance?.risk?.evidenceSources) ? results.provenance.risk.evidenceSources.map((x) => toText(x)) : [],
+        extractedAt: results?.provenance?.risk?.extractedAt || null,
+      },
     },
     quality: {
       partialData: Boolean(results?.quality?.partialData),
@@ -219,16 +296,19 @@ export function normalizeReport(results) {
         infra: results?.quality?.scannerErrors?.infra || null,
         build: results?.quality?.scannerErrors?.build || null,
         buyer: results?.quality?.scannerErrors?.buyer || null,
+        risk: results?.quality?.scannerErrors?.risk || null,
       },
       modelErrors: {
         infra: results?.quality?.modelErrors?.infra || null,
         build: results?.quality?.modelErrors?.build || null,
         buyer: results?.quality?.modelErrors?.buyer || null,
+        risk: results?.quality?.modelErrors?.risk || null,
       },
       modelWarnings: {
         infra: Array.isArray(results?.quality?.modelWarnings?.infra) ? results.quality.modelWarnings.infra : [],
         build: Array.isArray(results?.quality?.modelWarnings?.build) ? results.quality.modelWarnings.build : [],
         buyer: Array.isArray(results?.quality?.modelWarnings?.buyer) ? results.quality.modelWarnings.buyer : [],
+        risk: Array.isArray(results?.quality?.modelWarnings?.risk) ? results.quality.modelWarnings.risk : [],
       },
       anomalies: Array.isArray(results?.quality?.anomalies) ? results.quality.anomalies : [],
       completenessScore: toNum(results?.quality?.completenessScore, 100),
@@ -245,6 +325,10 @@ export function normalizeReport(results) {
           buyer: {
             tasksSucceeded: toNum(results?.quality?.qualityMeta?.pillarCoverage?.buyer?.tasksSucceeded),
             tasksExpected: toNum(results?.quality?.qualityMeta?.pillarCoverage?.buyer?.tasksExpected),
+          },
+          risk: {
+            tasksSucceeded: toNum(results?.quality?.qualityMeta?.pillarCoverage?.risk?.tasksSucceeded),
+            tasksExpected: toNum(results?.quality?.qualityMeta?.pillarCoverage?.risk?.tasksExpected),
           },
         },
         sourceCoverage: {
@@ -269,6 +353,13 @@ export function normalizeReport(results) {
             sourceCount: toNum(results?.quality?.qualityMeta?.sourceCoverage?.buyer?.sourceCount),
             expectedSources: toNum(results?.quality?.qualityMeta?.sourceCoverage?.buyer?.expectedSources),
           },
+          risk: {
+            sourceFamilies: Array.isArray(results?.quality?.qualityMeta?.sourceCoverage?.risk?.sourceFamilies)
+              ? results.quality.qualityMeta.sourceCoverage.risk.sourceFamilies
+              : [],
+            sourceCount: toNum(results?.quality?.qualityMeta?.sourceCoverage?.risk?.sourceCount),
+            expectedSources: toNum(results?.quality?.qualityMeta?.sourceCoverage?.risk?.expectedSources),
+          },
         },
         dataFreshness: {
           infra: {
@@ -283,12 +374,17 @@ export function normalizeReport(results) {
             extractedAt: results?.quality?.qualityMeta?.dataFreshness?.buyer?.extractedAt || null,
             freshness: toText(results?.quality?.qualityMeta?.dataFreshness?.buyer?.freshness, "unknown"),
           },
+          risk: {
+            extractedAt: results?.quality?.qualityMeta?.dataFreshness?.risk?.extractedAt || null,
+            freshness: toText(results?.quality?.qualityMeta?.dataFreshness?.risk?.freshness, "unknown"),
+          },
         },
         crossChecks: Array.isArray(results?.quality?.qualityMeta?.crossChecks) ? results.quality.qualityMeta.crossChecks : [],
         confidenceScore: {
           infra: toNum(results?.quality?.qualityMeta?.confidenceScore?.infra),
           build: toNum(results?.quality?.qualityMeta?.confidenceScore?.build),
           buyer: toNum(results?.quality?.qualityMeta?.confidenceScore?.buyer),
+          risk: toNum(results?.quality?.qualityMeta?.confidenceScore?.risk),
           global: toNum(results?.quality?.qualityMeta?.confidenceScore?.global),
           level: toText(results?.quality?.qualityMeta?.confidenceScore?.level, "low"),
         },
@@ -324,6 +420,17 @@ export function normalizeReport(results) {
               warningCount: toNum(results?.quality?.qualityMeta?.perPillar?.buyer?.scoreComponents?.warningCount),
               scannerFailed: Boolean(results?.quality?.qualityMeta?.perPillar?.buyer?.scoreComponents?.scannerFailed),
               modelFailed: Boolean(results?.quality?.qualityMeta?.perPillar?.buyer?.scoreComponents?.modelFailed),
+            },
+          },
+          risk: {
+            score: toNum(results?.quality?.qualityMeta?.perPillar?.risk?.score),
+            level: toText(results?.quality?.qualityMeta?.perPillar?.risk?.level, "low"),
+            scoreComponents: {
+              coverageScore: toNum(results?.quality?.qualityMeta?.perPillar?.risk?.scoreComponents?.coverageScore),
+              reliabilityScore: toNum(results?.quality?.qualityMeta?.perPillar?.risk?.scoreComponents?.reliabilityScore),
+              warningCount: toNum(results?.quality?.qualityMeta?.perPillar?.risk?.scoreComponents?.warningCount),
+              scannerFailed: Boolean(results?.quality?.qualityMeta?.perPillar?.risk?.scoreComponents?.scannerFailed),
+              modelFailed: Boolean(results?.quality?.qualityMeta?.perPillar?.risk?.scoreComponents?.modelFailed),
             },
           },
         },

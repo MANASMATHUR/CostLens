@@ -10,6 +10,7 @@ import { TinyFishWebAgentClient } from "./tinyfish/tinyfish-web-agent-client.js"
 import { InfraCostScanner } from "./services/infra-cost-scanner.js";
 import { BuildCostEstimator } from "./services/build-cost-estimator.js";
 import { BuyerCostAnalyzer } from "./services/buyer-cost-analyzer.js";
+import { TechRiskScanner } from "./services/tech-risk-scanner.js";
 import { CostModeler } from "./analysis/cost-modeler.js";
 import { config, getMissingRuntimeEnv } from "./config/index.js";
 
@@ -56,15 +57,15 @@ const corsOrigin = (origin, callback) => {
   }
 
   // In production, allow configured origins and the current Vercel deployment URL.
+  // On Vercel, auto-allow any *.vercel.app origin (deployment URLs, aliases, previews).
+  const isVercelDeployment = Boolean(process.env.VERCEL);
+  if (isVercelDeployment && /^https:\/\/[a-z0-9-]+\.vercel\.app$/i.test(origin)) {
+    callback(null, true);
+    return;
+  }
+
   const allowedProdOrigins = getAllowedProdOrigins();
   if (allowedProdOrigins.size === 0) {
-    // Fallback for Vercel deployments where VERCEL_URL injection is delayed/unavailable.
-    const isVercelDeployment = Boolean(process.env.VERCEL);
-    const isVercelPreviewOrigin = /^https:\/\/[a-z0-9-]+\.vercel\.app$/i.test(origin);
-    if (isVercelDeployment && isVercelPreviewOrigin) {
-      callback(null, true);
-      return;
-    }
     callback(corsDeniedError(origin));
     return;
   }
@@ -151,7 +152,7 @@ function assertValidAsyncPollPayload(body) {
     err.statusCode = 400;
     throw err;
   }
-  const keys = ["infra", "build", "buyer"];
+  const keys = ["infra", "build", "buyer", "risk"];
   for (const key of keys) {
     const id = runIds[key];
     if (id !== undefined && id !== null && typeof id !== "string") {
@@ -190,18 +191,20 @@ function buildQualityMeta({ scannerErrors, modelErrors, modelWarnings, anomalies
     infra: fastMode ? 2 : 4,
     build: fastMode ? 1 : 3,
     buyer: fastMode ? 1 : 5,
+    risk: fastMode ? 1 : 3,
   };
   const expectedTasks = {
     infra: fastMode ? 1 : 4,
     build: fastMode ? 1 : 3,
     buyer: fastMode ? 1 : 4,
+    risk: fastMode ? 1 : 3,
   };
   const perPillar = {};
   const sourceCoverage = {};
   const dataFreshness = {};
   const pillarCoverage = {};
   const confidenceScore = {};
-  const pillars = ["infra", "build", "buyer"];
+  const pillars = ["infra", "build", "buyer", "risk"];
   for (const pillar of pillars) {
     const meta = pillarMeta[pillar] || normalizePillarMeta(null, pillar);
     const uniqueFamilies = Array.isArray(meta.sourceFamilies) ? [...new Set(meta.sourceFamilies.filter(Boolean))] : [];
@@ -235,7 +238,7 @@ function buildQualityMeta({ scannerErrors, modelErrors, modelWarnings, anomalies
       tasksExpected: expectedTasks[pillar],
     };
   }
-  const global = Math.round((confidenceScore.infra + confidenceScore.build + confidenceScore.buyer) / 3);
+  const global = Math.round((confidenceScore.infra + confidenceScore.build + confidenceScore.buyer + confidenceScore.risk) / pillars.length);
   confidenceScore.global = global;
   confidenceScore.level = global >= 80 ? "high" : global >= 60 ? "medium" : "low";
   const crossChecks = (Array.isArray(anomalies) ? anomalies : []).map((note, idx) => ({
@@ -250,7 +253,7 @@ async function runInvestigation({ targetUrl, domain, onProgress }) {
   const name = domain.split(".")[0].charAt(0).toUpperCase() + domain.split(".")[0].slice(1);
   const tinyfish = new TinyFishWebAgentClient(config.tinyfish);
   const emit = onProgress || (() => {});
-  const scannerErrors = { infra: null, build: null, buyer: null };
+  const scannerErrors = { infra: null, build: null, buyer: null, risk: null };
   const fastOpt = { fast: config.fastMode };
 
   const runScanner = async (key, scannerPromiseFactory, fallback) => {
@@ -265,8 +268,8 @@ async function runInvestigation({ targetUrl, domain, onProgress }) {
 
   emit({ step: "init", message: "Initializing TinyFish engine...", progress: 5, platformsScanned: config.platformsScanned });
 
-  // Run all three pillars in parallel to stay under time limit
-  const partial = { infra: null, build: null, buyer: null };
+  // Run all four pillars in parallel to stay under time limit
+  const partial = { infra: null, build: null, buyer: null, risk: null };
   const infraP = runScanner(
     "infra",
     () => new InfraCostScanner(tinyfish).scan(targetUrl, fastOpt),
@@ -291,6 +294,14 @@ async function runInvestigation({ targetUrl, domain, onProgress }) {
     partial.buyer = r;
     return r;
   });
+  const riskP = runScanner(
+    "risk",
+    () => new TechRiskScanner(tinyfish).scan(targetUrl, fastOpt),
+    { securityHeaders: null, privacyCompliance: null, trackers: [] }
+  ).then((r) => {
+    partial.risk = r;
+    return r;
+  });
 
   const timeoutMs = config.investigationTimeoutMs || 100000;
   const timeoutP = new Promise((_, rej) =>
@@ -300,7 +311,7 @@ async function runInvestigation({ targetUrl, domain, onProgress }) {
   let timedOut = false;
   try {
     await Promise.race([
-      Promise.allSettled([infraP, buildP, buyerP]),
+      Promise.allSettled([infraP, buildP, buyerP, riskP]),
       timeoutP,
     ]);
   } catch (e) {
@@ -315,20 +326,36 @@ async function runInvestigation({ targetUrl, domain, onProgress }) {
   const infraRaw = partial.infra ?? {};
   const buildRaw = partial.build ?? { features: [], openSource: [], hiring: null };
   const buyerRaw = partial.buyer ?? { pricing: null, reviewInsights: [], limits: [], competitors: [] };
+  const riskRaw = partial.risk ?? { securityHeaders: null, privacyCompliance: null, trackers: [] };
 
-  emit({ step: "infra_done", message: "Infrastructure analysis complete", progress: 40 });
-  emit({ step: "build_done", message: "Build cost estimation complete", progress: 65 });
-  emit({ step: "buyer_done", message: "Buyer cost analysis complete", progress: 85 });
-  emit({ step: "ai", message: "AI synthesizing cost intelligence report...", progress: 90 });
+  emit({ step: "infra_done", message: "Infrastructure analysis complete", progress: 35 });
+  emit({ step: "build_done", message: "Build cost estimation complete", progress: 55 });
+  emit({ step: "buyer_done", message: "Buyer cost analysis complete", progress: 70 });
+  emit({ step: "risk_done", message: "Risk scan complete", progress: 80 });
+  emit({ step: "ai", message: "AI synthesizing cost intelligence report...", progress: 85 });
 
   let report;
+  const modeler = new CostModeler(config.openai);
   try {
-    const modeler = new CostModeler(config.openai);
     report = await modeler.analyze(infraRaw, buildRaw, buyerRaw, { name, url: domain });
   } catch (error) {
     console.error("[CostLens] Cost modeler failed:", error);
     throw new Error(error?.message || "AI report synthesis failed");
   }
+
+  emit({ step: "ai_extra", message: "Generating executive summary and risk analysis...", progress: 92 });
+
+  // Run executive summary, negotiation playbook, and risk analysis in parallel
+  const targetInfo = { name, url: domain };
+  const [execSummaryRes, negotiationRes, riskProfileRes] = await Promise.allSettled([
+    modeler.generateExecutiveSummary(report.infraCost, report.buildCost, report.buyerCost, targetInfo),
+    modeler.generateNegotiationPlaybook(report.infraCost, report.buyerCost, targetInfo),
+    modeler.analyzeRiskProfile(riskRaw, targetInfo),
+  ]);
+
+  const executiveSummary = execSummaryRes.status === "fulfilled" ? execSummaryRes.value : null;
+  const negotiation = negotiationRes.status === "fulfilled" ? negotiationRes.value : null;
+  const riskProfile = riskProfileRes.status === "fulfilled" ? riskProfileRes.value : modeler.getDefaultRiskProfile();
 
   emit({ step: "complete", message: "Investigation complete", progress: 100 });
   const failedPillars = Object.entries(scannerErrors).filter(([, v]) => Boolean(v)).map(([k]) => k);
@@ -345,6 +372,7 @@ async function runInvestigation({ targetUrl, domain, onProgress }) {
     infra: normalizePillarMeta(infraRaw, "infra"),
     build: normalizePillarMeta(buildRaw, "build"),
     buyer: normalizePillarMeta(buyerRaw, "buyer"),
+    risk: normalizePillarMeta(riskRaw, "risk"),
   };
   const qualityMeta = buildQualityMeta({
     scannerErrors,
@@ -355,13 +383,17 @@ async function runInvestigation({ targetUrl, domain, onProgress }) {
     timedOut,
     fastMode: Boolean(config.fastMode),
   });
-  const legacyCompleteness = Math.max(0, Math.round(((3 - Math.min(3, degradedPillars.length)) / 3) * 100));
+  const totalPillars = 4;
+  const legacyCompleteness = Math.max(0, Math.round(((totalPillars - Math.min(totalPillars, degradedPillars.length)) / totalPillars) * 100));
 
   return {
     target: { name, url: domain, logo: name[0] },
     scannedAt: new Date().toISOString(),
     platformsScanned: config.platformsScanned,
     ...report,
+    executiveSummary: executiveSummary || null,
+    negotiation: negotiation || null,
+    riskProfile: riskProfile || modeler.getDefaultRiskProfile(),
     infraCost: {
       ...report.infraCost,
       confidence: {
@@ -395,6 +427,10 @@ async function runInvestigation({ targetUrl, domain, onProgress }) {
       buyer: {
         evidenceSources: report?.buyerCost?.evidenceSources || [],
         extractedAt: pillarMeta.buyer.extractedAt,
+      },
+      risk: {
+        evidenceSources: [],
+        extractedAt: pillarMeta.risk.extractedAt,
       },
     },
     quality: {
@@ -441,6 +477,14 @@ function getFastAsyncGoals(targetUrl, domain) {
       goal: [
         "Find and extract pricing page details including plan cards and fine print.",
         'Return strict JSON only: { "plans": [{ "name": "string", "price": "string", "features": ["string"], "limits": ["string"] }], "finePrint": ["string"] }',
+      ].join(" "),
+    },
+    risk: {
+      url: targetUrl.startsWith("http") ? targetUrl : `https://${targetUrl}`,
+      goal: [
+        `Analyze ${domain} for security and compliance signals.`,
+        'Return strict JSON only: { "securityHeaders": { "https": true, "hsts": true, "csp": true, "xFrameOptions": "string|null", "xContentTypeOptions": true }, "privacyCompliance": { "privacyPolicyUrl": "string|null", "termsUrl": "string|null", "complianceBadges": ["string"], "cookieConsent": true }, "trackers": [{ "tracker": "string", "category": "analytics|advertising|social|functional|other", "dataShared": "string" }] }',
+        "Be conservative. Only list compliance badges if evidence exists on the site.",
       ].join(" "),
     },
   };
@@ -524,6 +568,28 @@ function coerceRunResultToBuyer(result) {
   };
 }
 
+function coerceRunResultToRisk(result) {
+  if (!result || typeof result !== "object") {
+    return { securityHeaders: null, privacyCompliance: null, trackers: [], _meta: normalizePillarMeta(null, "risk") };
+  }
+  const data = {
+    securityHeaders: result.securityHeaders && typeof result.securityHeaders === "object" ? result.securityHeaders : null,
+    privacyCompliance: result.privacyCompliance && typeof result.privacyCompliance === "object" ? result.privacyCompliance : null,
+    trackers: Array.isArray(result.trackers) ? result.trackers : [],
+  };
+  const sourceFamilies = [];
+  if (data.securityHeaders) sourceFamilies.push("securityHeaders");
+  if (data.privacyCompliance) sourceFamilies.push("privacyCompliance");
+  if (data.trackers.length) sourceFamilies.push("trackers");
+  return {
+    ...data,
+    _meta: normalizePillarMeta(
+      { _meta: { pillar: "risk", extractedAt: new Date().toISOString(), sourceFamilies } },
+      "risk"
+    ),
+  };
+}
+
 app.post("/api/investigate/async", async (req, res) => {
   try {
     assertRuntimeEnvReady();
@@ -532,27 +598,31 @@ app.post("/api/investigate/async", async (req, res) => {
     const goals = getFastAsyncGoals(targetUrl, domain);
     const tinyfish = new TinyFishWebAgentClient(config.tinyfish);
 
-    const [infraRun, buildRun, buyerRun] = await Promise.allSettled([
+    const [infraRun, buildRun, buyerRun, riskRun] = await Promise.allSettled([
       tinyfish.runAsync(goals.infra),
       tinyfish.runAsync(goals.build),
       tinyfish.runAsync(goals.buyer),
+      tinyfish.runAsync(goals.risk),
     ]);
 
     const infraRes = infraRun.status === "fulfilled" ? infraRun.value : { error: { message: infraRun.reason?.message || "infra run failed" } };
     const buildRes = buildRun.status === "fulfilled" ? buildRun.value : { error: { message: buildRun.reason?.message || "build run failed" } };
     const buyerRes = buyerRun.status === "fulfilled" ? buyerRun.value : { error: { message: buyerRun.reason?.message || "buyer run failed" } };
+    const riskRes = riskRun.status === "fulfilled" ? riskRun.value : { error: { message: riskRun.reason?.message || "risk run failed" } };
     const runIds = {
       infra: infraRes?.run_id ?? null,
       build: buildRes?.run_id ?? null,
       buyer: buyerRes?.run_id ?? null,
+      risk: riskRes?.run_id ?? null,
     };
     if (infraRes?.error?.message) runIds._infraError = infraRes.error.message;
     if (buildRes?.error?.message) runIds._buildError = buildRes.error.message;
     if (buyerRes?.error?.message) runIds._buyerError = buyerRes.error.message;
-    if (!runIds.infra && !runIds.build && !runIds.buyer) {
+    if (riskRes?.error?.message) runIds._riskError = riskRes.error.message;
+    if (!runIds.infra && !runIds.build && !runIds.buyer && !runIds.risk) {
       return res.status(502).json({ error: "Failed to start async investigation runs.", runIds, domain, name });
     }
-    const partial = [runIds._infraError, runIds._buildError, runIds._buyerError].some(Boolean);
+    const partial = [runIds._infraError, runIds._buildError, runIds._buyerError, runIds._riskError].some(Boolean);
     res.status(partial ? 207 : 200).json({ runIds, domain, name, partial });
   } catch (error) {
     console.error("[CostLens] Async start error:", error);
@@ -576,16 +646,18 @@ app.post("/api/investigate/async/poll", async (req, res) => {
       }
     };
 
-    const [infraRun, buildRun, buyerRun] = await Promise.all([
+    const [infraRun, buildRun, buyerRun, riskRun] = await Promise.all([
       safeGetRun(runIds.infra),
       safeGetRun(runIds.build),
       safeGetRun(runIds.buyer),
+      safeGetRun(runIds.risk),
     ]);
 
     const statuses = {
       infra: infraRun?.status ?? "FAILED",
       build: buildRun?.status ?? "FAILED",
       buyer: buyerRun?.status ?? "FAILED",
+      risk: riskRun?.status ?? "FAILED",
     };
     const running = ["PENDING", "RUNNING"].some((s) => Object.values(statuses).includes(s));
     if (running) {
@@ -595,14 +667,27 @@ app.post("/api/investigate/async/poll", async (req, res) => {
     const infraRaw = coerceRunResultToInfra(infraRun?.result);
     const buildRaw = coerceRunResultToBuild(buildRun?.result);
     const buyerRaw = coerceRunResultToBuyer(buyerRun?.result);
+    const riskRaw = coerceRunResultToRisk(riskRun?.result);
 
     const modeler = new CostModeler(config.openai);
     const report = await modeler.analyze(infraRaw, buildRaw, buyerRaw, { name, url: domain });
+
+    // Generate executive summary, negotiation playbook, and risk profile
+    const targetInfo = { name, url: domain };
+    const [execSummaryRes, negotiationRes, riskProfileRes] = await Promise.allSettled([
+      modeler.generateExecutiveSummary(report.infraCost, report.buildCost, report.buyerCost, targetInfo),
+      modeler.generateNegotiationPlaybook(report.infraCost, report.buyerCost, targetInfo),
+      modeler.analyzeRiskProfile(riskRaw, targetInfo),
+    ]);
+    const executiveSummary = execSummaryRes.status === "fulfilled" ? execSummaryRes.value : null;
+    const negotiation = negotiationRes.status === "fulfilled" ? negotiationRes.value : null;
+    const riskProfile = riskProfileRes.status === "fulfilled" ? riskProfileRes.value : modeler.getDefaultRiskProfile();
 
     const scannerErrors = {
       infra: infraRun?.status === "COMPLETED" ? null : infraRun?.error?.message ?? "Run failed",
       build: buildRun?.status === "COMPLETED" ? null : buildRun?.error?.message ?? "Run failed",
       buyer: buyerRun?.status === "COMPLETED" ? null : buyerRun?.error?.message ?? "Run failed",
+      risk: riskRun?.status === "COMPLETED" ? null : riskRun?.error?.message ?? "Run failed",
     };
     const failedPillars = Object.entries(scannerErrors).filter(([, v]) => Boolean(v)).map(([k]) => k);
     const modelErrors = report?.quality?.modelErrors || {};
@@ -615,6 +700,7 @@ app.post("/api/investigate/async/poll", async (req, res) => {
       infra: normalizePillarMeta(infraRaw, "infra"),
       build: normalizePillarMeta(buildRaw, "build"),
       buyer: normalizePillarMeta(buyerRaw, "buyer"),
+      risk: normalizePillarMeta(riskRaw, "risk"),
     };
     const qualityMeta = buildQualityMeta({
       scannerErrors,
@@ -625,7 +711,8 @@ app.post("/api/investigate/async/poll", async (req, res) => {
       timedOut: false,
       fastMode: true,
     });
-    const legacyCompleteness = Math.max(0, Math.round(((3 - Math.min(3, degradedPillars.length)) / 3) * 100));
+    const totalPillars = 4;
+  const legacyCompleteness = Math.max(0, Math.round(((totalPillars - Math.min(totalPillars, degradedPillars.length)) / totalPillars) * 100));
 
     res.json({
       status: "complete",
@@ -634,6 +721,9 @@ app.post("/api/investigate/async/poll", async (req, res) => {
         scannedAt: new Date().toISOString(),
         platformsScanned: config.platformsScanned,
         ...report,
+        executiveSummary: executiveSummary || null,
+        negotiation: negotiation || null,
+        riskProfile: riskProfile || modeler.getDefaultRiskProfile(),
         infraCost: {
           ...report.infraCost,
           confidence: {
@@ -667,6 +757,10 @@ app.post("/api/investigate/async/poll", async (req, res) => {
           buyer: {
             evidenceSources: report?.buyerCost?.evidenceSources || [],
             extractedAt: pillarMeta.buyer.extractedAt,
+          },
+          risk: {
+            evidenceSources: [],
+            extractedAt: pillarMeta.risk.extractedAt,
           },
         },
         quality: {
@@ -809,13 +903,14 @@ if (!process.env.VERCEL) {
   }
 
   function tryListen(port) {
-    const server = app.listen(port, () => {
-      console.log(`[CostLens] Running on http://localhost:${port}`);
+    const numPort = Number(port);
+    const server = app.listen(numPort, () => {
+      console.log(`[CostLens] Running on http://localhost:${numPort}`);
     });
     server.on("error", (err) => {
       if (err.code === "EADDRINUSE") {
-        console.warn(`[CostLens] Port ${port} in use, trying ${port + 1}...`);
-        tryListen(port + 1);
+        console.warn(`[CostLens] Port ${numPort} in use, trying ${numPort + 1}...`);
+        tryListen(numPort + 1);
       } else {
         throw err;
       }

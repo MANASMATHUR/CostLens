@@ -11,6 +11,7 @@ export class InfraCostScanner {
 
   async scan(targetUrl, options = {}) {
     const fast = options.fast === true;
+    const extractedAt = new Date().toISOString();
     // Ultra-fast: 1 combined run for infra (tech + traffic). Fast: 2 runs. Full: 4 runs.
     const tasks = fast
       ? [this.detectTechStackAndTraffic(targetUrl)]
@@ -23,18 +24,26 @@ export class InfraCostScanner {
     const results = await Promise.allSettled(tasks);
     if (fast) {
       const combined = results[0]?.status === "fulfilled" ? results[0].value : {};
-      return {
+      const result = {
         techStack: combined.techStack ?? null,
         traffic: combined.traffic ?? null,
         thirdParty: null,
         headcount: null,
       };
+      return {
+        ...result,
+        _meta: this.buildMeta({ pillar: "infra", extractedAt, result }),
+      };
     }
-    return {
+    const result = {
       techStack: results[0]?.status === "fulfilled" ? results[0].value : null,
       traffic: results[1]?.status === "fulfilled" ? results[1].value : null,
       thirdParty: results[2]?.status === "fulfilled" ? results[2].value : null,
       headcount: results[3]?.status === "fulfilled" ? results[3].value : null,
+    };
+    return {
+      ...result,
+      _meta: this.buildMeta({ pillar: "infra", extractedAt, result }),
     };
   }
 
@@ -137,5 +146,28 @@ export class InfraCostScanner {
   _coerceObject(value) {
     if (value && typeof value === "object" && !Array.isArray(value)) return value;
     return {};
+  }
+
+  buildMeta({ pillar, extractedAt, result }) {
+    const sourceFamilies = [];
+    if (this._hasDataObject(result?.techStack)) sourceFamilies.push("techStack");
+    if (this._hasDataObject(result?.traffic)) sourceFamilies.push("trafficSignals");
+    if (Array.isArray(result?.thirdParty) && result.thirdParty.length > 0) sourceFamilies.push("thirdParty");
+    if (this._hasDataObject(result?.headcount)) sourceFamilies.push("headcount");
+    return {
+      pillar,
+      extractedAt,
+      sourceFamilies,
+      sourceCount: sourceFamilies.length,
+    };
+  }
+
+  _hasDataObject(value) {
+    return Boolean(
+      value &&
+      typeof value === "object" &&
+      !Array.isArray(value) &&
+      Object.keys(value).length > 0
+    );
   }
 }

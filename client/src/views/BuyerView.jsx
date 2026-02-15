@@ -1,19 +1,75 @@
 import { Panel } from "../components/ui/Panel";
 import { SectionLabel } from "../components/ui/SectionLabel";
 import { DegradedBanner } from "../components/ui/DegradedBanner";
+import { WhyHint } from "../components/ui/WhyHint";
+import { ConfBadge } from "../components/Badges";
 import { colors, space, type } from "../styles/tokens";
 
 export function BuyerView({ report, degraded, degradedReason }) {
+  const confidenceLevel = report.buyerCost?.confidence?.level || "low";
+  const confidenceScore = report.buyerCost?.confidence?.overall || 0;
+  const provenance = report.provenance?.buyer || { evidenceSources: [] };
+  const hasConfidenceData =
+    (provenance.evidenceSources?.length || 0) > 0 ||
+    (report.buyerCost.validationWarnings?.length || 0) > 0 ||
+    confidenceScore > 0;
+  const buyerHintLines = [
+    `Confidence: ${confidenceScore}% (${confidenceLevel})`,
+    `Sources: ${provenance.evidenceSources?.length > 0 ? provenance.evidenceSources.join(", ") : "none"}`,
+    `Validation warnings: ${report.buyerCost.validationWarnings?.length || 0}`,
+  ];
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: space.lg, animation: "fadeUp 0.4s ease" }}>
       {degraded && <DegradedBanner title={degradedReason("buyer")} message="Buyer-cost findings are incomplete for this scan. Confirm key plan details manually." />}
 
+      <Panel>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+          <div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+              <SectionLabel style={{ marginBottom: 0 }}>Buyer Cost Confidence</SectionLabel>
+              <WhyHint lines={buyerHintLines} />
+            </div>
+            <div style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: type.sizeSm, color: colors.textSecondary }}>
+              {hasConfidenceData
+                ? `Overall confidence: ${confidenceScore}% (${confidenceLevel}) · values are estimated.`
+                : "Confidence details are not available yet for this run."}
+            </div>
+          </div>
+          {hasConfidenceData ? <ConfBadge level={confidenceLevel} /> : null}
+        </div>
+        {provenance.evidenceSources?.length > 0 && (
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8 }}>
+            {provenance.evidenceSources.map((src) => (
+              <span
+                key={src}
+                style={{
+                  fontFamily: "'IBM Plex Mono',monospace",
+                  fontSize: type.sizeXs,
+                  color: colors.textMuted,
+                  border: `1px solid ${colors.border}`,
+                  borderRadius: 999,
+                  padding: "3px 8px",
+                  background: colors.bg,
+                }}
+              >
+                source: {src}
+              </span>
+            ))}
+          </div>
+        )}
+        {report.buyerCost.validationWarnings?.length > 0 && (
+          <div style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: type.sizeXs, color: colors.accent, marginTop: 8 }}>
+            Validation notes: {report.buyerCost.validationWarnings.join(" | ")}
+          </div>
+        )}
+      </Panel>
+
       <Panel style={{ display: "flex", alignItems: "center", gap: space.md, background: colors.accentSoft, borderColor: "#C41E3A25" }}>
         <span style={{ fontSize: 22 }}>⚠️</span>
         <div>
-          <div style={{ fontFamily: "'Playfair Display',serif", fontWeight: 700, fontSize: 15 }}>The price on the page is rarely the price you pay</div>
+          <div style={{ fontFamily: "'Playfair Display',serif", fontWeight: 700, fontSize: 15 }}>Listed pricing often understates the actual cost</div>
           <div style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: type.sizeSm, color: colors.textSecondary }}>
-            Hidden costs can inflate {report.target.name}&apos;s listed price by 40-55% for typical teams.
+            Additional costs can increase {report.target.name}&apos;s listed price by 40-55% for typical teams.
           </div>
         </div>
       </Panel>
@@ -30,14 +86,14 @@ export function BuyerView({ report, degraded, degradedReason }) {
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 10 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
                 <span style={{ fontFamily: "'Playfair Display',serif", fontWeight: 900, fontSize: 18 }}>{plan.name}</span>
-                <span style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: type.sizeMd, color: colors.textMuted }}>Listed: {plan.listed}</span>
+                <span style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: type.sizeMd, color: colors.textMuted }}>Listed (estimated): {plan.listed}</span>
               </div>
-              <div style={{ fontFamily: "'IBM Plex Mono',monospace", fontWeight: 700, fontSize: 15, color: colors.accent }}>Actual: {plan.actualMonthly}</div>
+              <div style={{ fontFamily: "'IBM Plex Mono',monospace", fontWeight: 700, fontSize: 15, color: colors.accent }}>Actual (estimated): {plan.actualMonthly}</div>
             </div>
 
             {plan.hiddenCosts.length > 0 && (
               <div style={{ marginBottom: 10 }}>
-                <SectionLabel style={{ marginBottom: 6, color: colors.accent, fontWeight: 700 }}>Hidden Costs</SectionLabel>
+                <SectionLabel style={{ marginBottom: 6, color: colors.accent, fontWeight: 700 }}>Additional Costs</SectionLabel>
                 {plan.hiddenCosts.map((hc, j) => (
                   <div key={`hidden-${j}`} style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap", padding: "6px 10px", background: "#C41E3A06", borderRadius: 4, marginBottom: 3 }}>
                     <div>
@@ -51,10 +107,10 @@ export function BuyerView({ report, degraded, degradedReason }) {
             )}
 
             <div>
-              <SectionLabel style={{ marginBottom: 4 }}>Gotchas</SectionLabel>
-              {plan.gotchas.length === 0 && <div style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: type.sizeSm, color: colors.textMuted }}>No gotchas detected.</div>}
+              <SectionLabel style={{ marginBottom: 4 }}>Caveats</SectionLabel>
+              {plan.gotchas.length === 0 && <div style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: type.sizeSm, color: colors.textMuted }}>No caveats detected.</div>}
               {plan.gotchas.map((g, j) => (
-                <div key={`gotcha-${j}`} style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: type.sizeSm, color: colors.textSecondary, padding: "3px 0", display: "flex", gap: 6 }}>
+                <div key={`caveat-${j}`} style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: type.sizeSm, color: colors.textSecondary, padding: "3px 0", display: "flex", gap: 6 }}>
                   <span style={{ color: colors.accent, flexShrink: 0 }}>•</span>
                   {g}
                 </div>

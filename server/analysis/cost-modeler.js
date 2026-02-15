@@ -19,16 +19,39 @@ export class CostModeler {
       this.analyzeBuyerCosts(buyerData, targetInfo),
     ]);
 
+    const infraCost = infraRes.status === "fulfilled" ? infraRes.value : this.getDefaultInfraCost();
+    const buildCost = buildRes.status === "fulfilled" ? buildRes.value : this.getDefaultBuildCost();
+    const buyerCost = buyerRes.status === "fulfilled" ? buyerRes.value : this.getDefaultBuyerCost();
+    const crossValidation = this.crossValidateAgainstSignals({
+      infraCost,
+      buildCost,
+      buyerCost,
+      infraData,
+      buildData,
+      buyerData,
+    });
+
+    infraCost.validationWarnings = [...new Set([...(infraCost.validationWarnings || []), ...crossValidation.infraWarnings])];
+    buildCost.validationWarnings = [...new Set([...(buildCost.validationWarnings || []), ...crossValidation.buildWarnings])];
+    buyerCost.validationWarnings = [...new Set([...(buyerCost.validationWarnings || []), ...crossValidation.buyerWarnings])];
+    const anomalies = this.detectAnomalies({ infraCost, buildCost, buyerCost, crossValidationWarnings: crossValidation.anomalies });
+
     return {
-      infraCost: infraRes.status === "fulfilled" ? infraRes.value : this.getDefaultInfraCost(),
-      buildCost: buildRes.status === "fulfilled" ? buildRes.value : this.getDefaultBuildCost(),
-      buyerCost: buyerRes.status === "fulfilled" ? buyerRes.value : this.getDefaultBuyerCost(),
+      infraCost,
+      buildCost,
+      buyerCost,
       quality: {
         modelErrors: {
           infra: infraRes.status === "rejected" ? this.errorMessage(infraRes.reason) : null,
           build: buildRes.status === "rejected" ? this.errorMessage(buildRes.reason) : null,
           buyer: buyerRes.status === "rejected" ? this.errorMessage(buyerRes.reason) : null,
         },
+        modelWarnings: {
+          infra: Array.isArray(infraCost?.validationWarnings) ? infraCost.validationWarnings : [],
+          build: Array.isArray(buildCost?.validationWarnings) ? buildCost.validationWarnings : [],
+          buyer: Array.isArray(buyerCost?.validationWarnings) ? buyerCost.validationWarnings : [],
+        },
+        anomalies,
       },
     };
   }
@@ -172,6 +195,15 @@ Competitor Insights: ${JSON.stringify(data?.competitors || [])}`,
         }))
       : fallback.signals;
 
+    const evidenceSources = this.getEvidenceSources(input, ["techStack", "trafficSignals", "thirdParty", "headcount"]);
+    const validationWarnings = this.validateInfraCost({
+      monthlyEstimate: monthly,
+      perUserEstimate: perUser,
+      revenueEstimate: this.asNumber(input.revenueEstimate, 0),
+      grossMargin: margin,
+      breakdown,
+    });
+
     return {
       monthlyEstimate: monthly,
       perUserEstimate: perUser,
@@ -179,6 +211,13 @@ Competitor Insights: ${JSON.stringify(data?.competitors || [])}`,
       grossMargin: margin,
       breakdown: breakdown.length > 0 ? breakdown : fallback.breakdown,
       signals: signals.length > 0 ? signals : fallback.signals,
+      evidenceSources,
+      confidence: this.buildConfidence({
+        sourceCount: evidenceSources.length,
+        warningCount: validationWarnings.length,
+        fallbackPenalty: breakdown.length === 0 || signals.length === 0 ? 10 : 0,
+      }),
+      validationWarnings,
     };
   }
 
@@ -206,12 +245,28 @@ Competitor Insights: ${JSON.stringify(data?.competitors || [])}`,
         }))
       : fallback.techStack;
 
+    const evidenceSources = this.getEvidenceSources(input, ["features", "openSource", "hiringBenchmarks"]);
+    const validationWarnings = this.validateBuildCost({
+      totalEstimate,
+      timeEstimate,
+      teamSize,
+      breakdown,
+      techStack,
+    });
+
     return {
       totalEstimate,
       timeEstimate,
       teamSize,
       breakdown: breakdown.length > 0 ? breakdown : fallback.breakdown,
       techStack: techStack.length > 0 ? techStack : fallback.techStack,
+      evidenceSources,
+      confidence: this.buildConfidence({
+        sourceCount: evidenceSources.length,
+        warningCount: validationWarnings.length,
+        fallbackPenalty: breakdown.length === 0 || techStack.length === 0 ? 10 : 0,
+      }),
+      validationWarnings,
     };
   }
 
@@ -252,10 +307,20 @@ Competitor Insights: ${JSON.stringify(data?.competitors || [])}`,
         }))
       : fallback.competitorComparison;
 
+    const evidenceSources = this.getEvidenceSources(input, ["pricing", "pricingFinePrint", "reviews", "limitsDocs", "competitors"]);
+    const validationWarnings = this.validateBuyerCost({ plans, tcoComparison, competitorComparison });
+
     return {
       plans: plans.length > 0 ? plans : fallback.plans,
       tcoComparison: tcoComparison.length > 0 ? tcoComparison : fallback.tcoComparison,
       competitorComparison: competitorComparison.length > 0 ? competitorComparison : fallback.competitorComparison,
+      evidenceSources,
+      confidence: this.buildConfidence({
+        sourceCount: evidenceSources.length,
+        warningCount: validationWarnings.length,
+        fallbackPenalty: plans.length === 0 || tcoComparison.length === 0 ? 10 : 0,
+      }),
+      validationWarnings,
     };
   }
 
@@ -275,6 +340,9 @@ Competitor Insights: ${JSON.stringify(data?.competitors || [])}`,
         },
       ],
       signals: [{ icon: "•", text: "Limited signal quality. Treat estimates as directional." }],
+      evidenceSources: [],
+      confidence: { overall: 35, level: "low" },
+      validationWarnings: ["Using fallback infra defaults due to limited model output."],
     };
   }
 
@@ -293,6 +361,9 @@ Competitor Insights: ${JSON.stringify(data?.competitors || [])}`,
         },
       ],
       techStack: [{ layer: "Application", tech: "Unknown", detected: false, confidence: "low" }],
+      evidenceSources: [],
+      confidence: { overall: 35, level: "low" },
+      validationWarnings: ["Using fallback build defaults due to limited model output."],
     };
   }
 
@@ -317,7 +388,112 @@ Competitor Insights: ${JSON.stringify(data?.competitors || [])}`,
         },
       ],
       competitorComparison: [{ name: "Peer SaaS", cost: "Unknown", features: "Comparable feature set" }],
+      evidenceSources: [],
+      confidence: { overall: 35, level: "low" },
+      validationWarnings: ["Using fallback buyer-cost defaults due to limited model output."],
     };
+  }
+
+  getEvidenceSources(input, fallback) {
+    const sourceCandidates = Array.isArray(input?.evidenceSources) ? input.evidenceSources : input?._meta?.sourceFamilies;
+    if (Array.isArray(sourceCandidates) && sourceCandidates.length > 0) {
+      return [...new Set(sourceCandidates.map((x) => this.asString(x)).filter(Boolean))];
+    }
+    return fallback;
+  }
+
+  buildConfidence({ sourceCount = 0, warningCount = 0, fallbackPenalty = 0 }) {
+    let score = 45 + sourceCount * 10 - warningCount * 12 - fallbackPenalty;
+    score = Math.max(10, Math.min(95, Math.round(score)));
+    const level = score >= 80 ? "high" : score >= 60 ? "medium" : "low";
+    return { overall: score, level };
+  }
+
+  validateInfraCost(value) {
+    const warnings = [];
+    const margin = value?.grossMargin || {};
+    if (margin.high > 99 || margin.low < 5) warnings.push("Gross margin looks outside realistic SaaS ranges.");
+    if ((value?.monthlyEstimate?.high || 0) > 200000000) warnings.push("Monthly infra high estimate exceeds expected bounds.");
+    if ((value?.perUserEstimate?.high || 0) > 1000) warnings.push("Per-user infra estimate appears unusually high.");
+    if ((value?.revenueEstimate || 0) < 0) warnings.push("Revenue estimate was negative and may be unreliable.");
+    return warnings;
+  }
+
+  validateBuildCost(value) {
+    const warnings = [];
+    if ((value?.teamSize?.max || 0) > 500 || (value?.teamSize?.min || 0) < 1) warnings.push("Team size range appears unrealistic.");
+    if ((value?.timeEstimate?.high || 0) > 120) warnings.push("Timeline high estimate is unusually long.");
+    if ((value?.totalEstimate?.high || 0) > 1000000000) warnings.push("Build high estimate exceeds expected bounds.");
+    return warnings;
+  }
+
+  validateBuyerCost(value) {
+    const warnings = [];
+    if (!Array.isArray(value?.plans) || value.plans.length === 0) warnings.push("Plan-level pricing evidence is missing.");
+    if (!Array.isArray(value?.tcoComparison) || value.tcoComparison.length === 0) warnings.push("TCO comparison evidence is limited.");
+    if (!Array.isArray(value?.competitorComparison) || value.competitorComparison.length === 0) warnings.push("Competitor benchmarks are missing.");
+    return warnings;
+  }
+
+  detectAnomalies({ infraCost, buildCost, buyerCost, crossValidationWarnings = [] }) {
+    const anomalies = [];
+    const monthlyMid = this.asNumber(infraCost?.monthlyEstimate?.mid, 0);
+    const revenue = this.asNumber(infraCost?.revenueEstimate, 0);
+    if (revenue > 0 && monthlyMid > revenue * 2) {
+      anomalies.push("Infra monthly midpoint is over 2x the inferred monthly revenue.");
+    }
+    const teamOptimal = this.asNumber(buildCost?.teamSize?.optimal, 0);
+    const buildMonths = this.asNumber(buildCost?.timeEstimate?.mid, 0);
+    if (teamOptimal > 0 && buildMonths > 0 && teamOptimal * buildMonths > 1000) {
+      anomalies.push("Build staffing-month load appears unusually high.");
+    }
+    const buyerPlans = Array.isArray(buyerCost?.plans) ? buyerCost.plans : [];
+    if (buyerPlans.length > 0 && buyerPlans.every((x) => this.asString(x?.actualMonthly, "Unknown") === "Unknown")) {
+      anomalies.push("Buyer actual monthly pricing remained unknown across detected plans.");
+    }
+    return [...new Set([...anomalies, ...crossValidationWarnings])];
+  }
+
+  crossValidateAgainstSignals({ infraCost, buildCost, buyerCost, infraData, buildData, buyerData }) {
+    const infraWarnings = [];
+    const buildWarnings = [];
+    const buyerWarnings = [];
+    const anomalies = [];
+
+    const hasTrafficSignal = Boolean(infraData?.traffic && Object.keys(infraData.traffic).length > 0);
+    if (!hasTrafficSignal && this.asNumber(infraCost?.revenueEstimate, 0) > 0) {
+      infraWarnings.push("Revenue estimate inferred without concrete traffic signals.");
+      anomalies.push("Revenue estimate exists but traffic evidence was missing.");
+    }
+    const hasInfraSignals = Boolean(infraData?.techStack && Object.keys(infraData.techStack).length > 0);
+    if (!hasInfraSignals && this.asNumber(infraCost?.monthlyEstimate?.mid, 0) > 0) {
+      infraWarnings.push("Infrastructure estimate inferred with sparse technical evidence.");
+    }
+
+    const featureCount = Array.isArray(buildData?.features?.detected) ? buildData.features.detected.length : 0;
+    if (featureCount === 0 && this.asNumber(buildCost?.totalEstimate?.mid, 0) > 20000000) {
+      buildWarnings.push("High build estimate inferred without detected feature evidence.");
+      anomalies.push("Build estimate appears high relative to detected feature count.");
+    }
+    const hiringSignals = buildData?.hiring && typeof buildData.hiring === "object" ? Object.keys(buildData.hiring).length : 0;
+    if (hiringSignals === 0 && this.asNumber(buildCost?.teamSize?.optimal, 0) >= 20) {
+      buildWarnings.push("Large team recommendation inferred without hiring benchmark signals.");
+    }
+
+    const pricingPlans = Array.isArray(buyerData?.pricing?.plans) ? buyerData.pricing.plans.length : 0;
+    const extractedPlans = Array.isArray(buyerCost?.plans) ? buyerCost.plans.length : 0;
+    if (pricingPlans === 0 && extractedPlans > 0) {
+      buyerWarnings.push("Buyer plans were inferred without direct pricing-page plan extraction.");
+      anomalies.push("Buyer plan output exceeds source pricing evidence.");
+    }
+    const knownActualPlans = Array.isArray(buyerCost?.plans)
+      ? buyerCost.plans.filter((p) => this.asString(p?.actualMonthly, "Unknown") !== "Unknown").length
+      : 0;
+    if (knownActualPlans > 0 && pricingPlans === 0) {
+      buyerWarnings.push("Actual monthly plan values may be speculative due to missing source pricing plans.");
+    }
+
+    return { infraWarnings, buildWarnings, buyerWarnings, anomalies };
   }
 
   normalizeTriad(value, fallback) {

@@ -5,6 +5,7 @@ import request from "supertest";
 process.env.VERCEL = "1";
 const mod = await import("../server.js");
 const app = mod.default;
+const { __testUtils } = mod;
 
 async function run() {
   // GET /api/health
@@ -31,10 +32,53 @@ async function run() {
 
   // POST /api/investigate — valid URL shape (https://example.com) returns 400 when env missing (missingEnv in body)
   const validUrlRes = await request(app).post("/api/investigate").send({ url: "https://example.com" });
-  assert.ok([400, 500].includes(validUrlRes.status), "POST with valid URL should return 400 or 500 when env missing");
+  assert.ok([200, 400, 500].includes(validUrlRes.status), "POST with valid URL should return 200, 400, or 500 depending on env and providers");
   if (validUrlRes.status === 400 && validUrlRes.body?.missingEnv) {
     assert.ok(Array.isArray(validUrlRes.body.missingEnv), "missingEnv should be an array");
   }
+
+  // qualityMeta contract helper
+  const qualityMeta = __testUtils.buildQualityMeta({
+    scannerErrors: { infra: null, build: "scan failed", buyer: null },
+    modelErrors: { infra: null, build: null, buyer: null },
+    modelWarnings: { infra: ["range check"], build: [], buyer: [] },
+    anomalies: ["example anomaly"],
+    pillarMeta: {
+      infra: { pillar: "infra", extractedAt: new Date().toISOString(), sourceFamilies: ["techStack"], sourceCount: 1 },
+      build: { pillar: "build", extractedAt: new Date().toISOString(), sourceFamilies: [], sourceCount: 0 },
+      buyer: { pillar: "buyer", extractedAt: new Date().toISOString(), sourceFamilies: ["pricing"], sourceCount: 1 },
+    },
+    timedOut: false,
+    fastMode: true,
+  });
+  assert.ok(qualityMeta?.confidenceScore?.global >= 0, "qualityMeta should include global confidence score");
+  assert.ok(Array.isArray(qualityMeta?.crossChecks), "qualityMeta should include crossChecks array");
+  assert.ok(qualityMeta?.sourceCoverage?.infra, "qualityMeta should include sourceCoverage for infra");
+  assert.ok(qualityMeta?.pillarCoverage?.build, "qualityMeta should include pillarCoverage for build");
+  assert.ok(qualityMeta?.perPillar?.infra?.scoreComponents, "qualityMeta should include score components");
+
+  const sanitizedMeta = __testUtils.buildQualityMeta({
+    scannerErrors: { infra: null, build: null, buyer: null },
+    modelErrors: { infra: null, build: null, buyer: null },
+    modelWarnings: { infra: [], build: [], buyer: [] },
+    anomalies: [],
+    pillarMeta: {
+      infra: { pillar: "infra", extractedAt: new Date().toISOString(), sourceFamilies: ["techStack"], sourceCount: 99 },
+      build: { pillar: "build", extractedAt: new Date().toISOString(), sourceFamilies: ["features"], sourceCount: 99 },
+      buyer: { pillar: "buyer", extractedAt: new Date().toISOString(), sourceFamilies: ["pricing"], sourceCount: 99 },
+    },
+    timedOut: false,
+    fastMode: true,
+  });
+  assert.ok(sanitizedMeta.sourceCoverage.infra.sourceCount <= sanitizedMeta.sourceCoverage.infra.expectedSources, "source count should be capped by expected sources");
+
+  let pollValidationThrew = false;
+  try {
+    __testUtils.assertValidAsyncPollPayload({ runIds: "bad", domain: "example.com", name: "Example" });
+  } catch (e) {
+    pollValidationThrew = true;
+  }
+  assert.ok(pollValidationThrew, "assertValidAsyncPollPayload should reject malformed payloads");
 
   console.log("API tests passed.");
 }

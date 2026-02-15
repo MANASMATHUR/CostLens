@@ -8,12 +8,12 @@ export function LandingView({ url, setUrl, runScan, scanning, scanError, onClear
           Powered by TinyFish Web Agent
         </div>
         <h1 style={{ fontFamily: "'Playfair Display',serif", fontSize: type.sizeHero, fontWeight: 900, lineHeight: 1.05, marginBottom: space.lg, letterSpacing: "-0.02em" }}>
-          Strip any SaaS
+          Analyze any SaaS
           <br />
           down to its <span style={{ color: colors.accent, fontStyle: "italic" }}>true cost</span>
         </h1>
         <p style={{ fontSize: 17, color: colors.textSecondary, lineHeight: 1.7, maxWidth: 460, margin: "0 auto" }}>
-          See what it costs them to run, what it would cost to build, and what it actually costs you — including every hidden fee.
+          See what it costs them to run, what it would cost to build, and what it actually costs you — including every additional fee.
         </p>
       </div>
 
@@ -115,7 +115,7 @@ export function LandingView({ url, setUrl, runScan, scanning, scanError, onClear
         {[
           { num: "01", title: "Their Cost", desc: "What it costs the company to run — infrastructure, team, third-party services.", icon: "🔬" },
           { num: "02", title: "Build Cost", desc: "What it would cost to build from scratch, module by module.", icon: "🏗️" },
-          { num: "03", title: "Your Cost", desc: "Hidden fees, overage charges, SSO tax, and add-on penalties.", icon: "💸" },
+          { num: "03", title: "Your Cost", desc: "Additional fees, overage charges, SSO surcharges, and add-on costs.", icon: "💸" },
         ].map((p) => (
           <div key={p.num} style={{ padding: "20px", border: `1px solid ${colors.border}`, borderRadius: radius.md, background: colors.surface }}>
             <div style={{ fontFamily: "'Playfair Display',serif", fontSize: 28, fontWeight: 900, color: colors.accent, opacity: 0.3, marginBottom: 8 }}>{p.num}</div>

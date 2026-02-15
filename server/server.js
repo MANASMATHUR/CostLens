@@ -1,10 +1,11 @@
 // ============================================================
-// NAKEDSAAS BACKEND — Strip Any SaaS to Its True Cost
+// COSTLENS BACKEND — Analyze Any SaaS Down to Its True Cost
 // Three pillars: Infra cost, Build cost, Buyer cost
 // ============================================================
 
 import express from "express";
 import cors from "cors";
+import rateLimit from "express-rate-limit";
 import { TinyFishWebAgentClient } from "./tinyfish/tinyfish-web-agent-client.js";
 import { InfraCostScanner } from "./services/infra-cost-scanner.js";
 import { BuildCostEstimator } from "./services/build-cost-estimator.js";
@@ -18,12 +19,28 @@ const MAX_URL_LENGTH = 2048;
 
 const app = express();
 const isProduction = process.env.NODE_ENV === "production";
-const vercelUrl = process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "";
 const configuredOrigins = (process.env.CORS_ORIGIN || "")
   .split(",")
   .map((origin) => origin.trim())
   .filter(Boolean);
-const allowedProdOrigins = new Set([...configuredOrigins, vercelUrl].filter(Boolean));
+function getAllowedProdOrigins() {
+  const vercelUrl = process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "";
+  return new Set([...configuredOrigins, vercelUrl].filter(Boolean));
+}
+
+const apiRateLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: isProduction ? 120 : 600,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests. Please retry in a minute." },
+});
+
+function corsDeniedError(origin) {
+  const err = new Error(`Origin not allowed by CORS${origin ? `: ${origin}` : ""}`);
+  err.statusCode = 403;
+  return err;
+}
 
 const corsOrigin = (origin, callback) => {
   // Allow non-browser clients and same-origin requests with no Origin header.
@@ -39,15 +56,28 @@ const corsOrigin = (origin, callback) => {
   }
 
   // In production, allow configured origins and the current Vercel deployment URL.
+  const allowedProdOrigins = getAllowedProdOrigins();
   if (allowedProdOrigins.size === 0) {
-    callback(null, true);
+    // Fallback for Vercel deployments where VERCEL_URL injection is delayed/unavailable.
+    const isVercelDeployment = Boolean(process.env.VERCEL);
+    const isVercelPreviewOrigin = /^https:\/\/[a-z0-9-]+\.vercel\.app$/i.test(origin);
+    if (isVercelDeployment && isVercelPreviewOrigin) {
+      callback(null, true);
+      return;
+    }
+    callback(corsDeniedError(origin));
     return;
   }
-  callback(null, allowedProdOrigins.has(origin));
+  if (!allowedProdOrigins.has(origin)) {
+    callback(corsDeniedError(origin));
+    return;
+  }
+  callback(null, true);
 };
 
 app.use(cors({ origin: corsOrigin }));
 app.use(express.json({ limit: "256kb" }));
+app.use("/api", apiRateLimiter);
 
 app.get("/api/health", (_, res) => {
   const missingEnv = getMissingRuntimeEnv();
@@ -104,6 +134,118 @@ function assertRuntimeEnvReady() {
   }
 }
 
+function assertValidAsyncPollPayload(body) {
+  const { runIds, domain, name } = body || {};
+  if (!runIds || typeof runIds !== "object" || Array.isArray(runIds)) {
+    const err = new Error("runIds must be an object.");
+    err.statusCode = 400;
+    throw err;
+  }
+  if (typeof domain !== "string" || !domain.includes(".") || domain.length > 255) {
+    const err = new Error("domain must be a valid hostname.");
+    err.statusCode = 400;
+    throw err;
+  }
+  if (typeof name !== "string" || name.trim().length < 1 || name.length > 100) {
+    const err = new Error("name must be a non-empty string.");
+    err.statusCode = 400;
+    throw err;
+  }
+  const keys = ["infra", "build", "buyer"];
+  for (const key of keys) {
+    const id = runIds[key];
+    if (id !== undefined && id !== null && typeof id !== "string") {
+      const err = new Error(`runIds.${key} must be a string when provided.`);
+      err.statusCode = 400;
+      throw err;
+    }
+  }
+}
+
+function normalizePillarMeta(value, fallbackPillar) {
+  const meta = value && typeof value === "object" ? value._meta : null;
+  return {
+    pillar: meta?.pillar || fallbackPillar,
+    extractedAt: meta?.extractedAt || new Date().toISOString(),
+    sourceFamilies: Array.isArray(meta?.sourceFamilies) ? [...new Set(meta.sourceFamilies)] : [],
+    sourceCount: Number.isFinite(Number(meta?.sourceCount))
+      ? Number(meta.sourceCount)
+      : Array.isArray(meta?.sourceFamilies)
+        ? meta.sourceFamilies.length
+        : 0,
+  };
+}
+
+function freshnessBucket(extractedAt) {
+  const ts = Date.parse(extractedAt || "");
+  if (!Number.isFinite(ts)) return "unknown";
+  const ageHours = Math.max(0, (Date.now() - ts) / (1000 * 60 * 60));
+  if (ageHours <= 6) return "fresh";
+  if (ageHours <= 24) return "stale";
+  return "old";
+}
+
+function buildQualityMeta({ scannerErrors, modelErrors, modelWarnings, anomalies, pillarMeta, timedOut, fastMode }) {
+  const expectedSources = {
+    infra: fastMode ? 2 : 4,
+    build: fastMode ? 1 : 3,
+    buyer: fastMode ? 1 : 5,
+  };
+  const expectedTasks = {
+    infra: fastMode ? 1 : 4,
+    build: fastMode ? 1 : 3,
+    buyer: fastMode ? 1 : 4,
+  };
+  const perPillar = {};
+  const sourceCoverage = {};
+  const dataFreshness = {};
+  const pillarCoverage = {};
+  const confidenceScore = {};
+  const pillars = ["infra", "build", "buyer"];
+  for (const pillar of pillars) {
+    const meta = pillarMeta[pillar] || normalizePillarMeta(null, pillar);
+    const uniqueFamilies = Array.isArray(meta.sourceFamilies) ? [...new Set(meta.sourceFamilies.filter(Boolean))] : [];
+    const safeSourceCount = Math.max(0, Math.min(expectedSources[pillar], Math.min(meta.sourceCount, uniqueFamilies.length || meta.sourceCount)));
+    const scannerFailed = Boolean(scannerErrors?.[pillar]);
+    const modelFailed = Boolean(modelErrors?.[pillar]);
+    const warningCount = Array.isArray(modelWarnings?.[pillar]) ? modelWarnings[pillar].length : 0;
+    const coverageScore = Math.round((safeSourceCount / expectedSources[pillar]) * 100);
+    const reliabilityScore = Math.max(
+      0,
+      100 - (scannerFailed ? 45 : 0) - (modelFailed ? 35 : 0) - warningCount * 8 - (timedOut ? 10 : 0)
+    );
+    const score = Math.max(0, Math.min(100, Math.round(coverageScore * 0.45 + reliabilityScore * 0.55)));
+    perPillar[pillar] = {
+      score,
+      level: score >= 80 ? "high" : score >= 60 ? "medium" : "low",
+      scoreComponents: { coverageScore, reliabilityScore, warningCount, scannerFailed, modelFailed },
+    };
+    confidenceScore[pillar] = score;
+    sourceCoverage[pillar] = {
+      sourceFamilies: uniqueFamilies,
+      sourceCount: safeSourceCount,
+      expectedSources: expectedSources[pillar],
+    };
+    dataFreshness[pillar] = {
+      extractedAt: meta.extractedAt,
+      freshness: freshnessBucket(meta.extractedAt),
+    };
+    pillarCoverage[pillar] = {
+      tasksSucceeded: scannerFailed ? 0 : expectedTasks[pillar],
+      tasksExpected: expectedTasks[pillar],
+    };
+  }
+  const global = Math.round((confidenceScore.infra + confidenceScore.build + confidenceScore.buyer) / 3);
+  confidenceScore.global = global;
+  confidenceScore.level = global >= 80 ? "high" : global >= 60 ? "medium" : "low";
+  const crossChecks = (Array.isArray(anomalies) ? anomalies : []).map((note, idx) => ({
+    id: `anomaly_${idx + 1}`,
+    status: "conflict",
+    note,
+  }));
+  return { pillarCoverage, sourceCoverage, dataFreshness, crossChecks, confidenceScore, perPillar };
+}
+
 async function runInvestigation({ targetUrl, domain, onProgress }) {
   const name = domain.split(".")[0].charAt(0).toUpperCase() + domain.split(".")[0].slice(1);
   const tinyfish = new TinyFishWebAgentClient(config.tinyfish);
@@ -116,7 +258,7 @@ async function runInvestigation({ targetUrl, domain, onProgress }) {
       return await scannerPromiseFactory();
     } catch (error) {
       scannerErrors[key] = error?.message || `Failed ${key} scanner`;
-      console.error(`[NakedSaaS] ${key} scanner failed:`, error);
+      console.error(`[CostLens] ${key} scanner failed:`, error);
       return fallback;
     }
   };
@@ -164,7 +306,7 @@ async function runInvestigation({ targetUrl, domain, onProgress }) {
   } catch (e) {
     if (e?._timeout) {
       timedOut = true;
-      console.warn("[NakedSaaS] Investigation timeout; using partial results.");
+      console.warn("[CostLens] Investigation timeout; using partial results.");
     } else {
       throw e;
     }
@@ -184,7 +326,7 @@ async function runInvestigation({ targetUrl, domain, onProgress }) {
     const modeler = new CostModeler(config.openai);
     report = await modeler.analyze(infraRaw, buildRaw, buyerRaw, { name, url: domain });
   } catch (error) {
-    console.error("[NakedSaaS] Cost modeler failed:", error);
+    console.error("[CostLens] Cost modeler failed:", error);
     throw new Error(error?.message || "AI report synthesis failed");
   }
 
@@ -194,20 +336,76 @@ async function runInvestigation({ targetUrl, domain, onProgress }) {
     failedPillars.push("timeout");
   }
   const modelErrors = report?.quality?.modelErrors || {};
+  const modelWarnings = report?.quality?.modelWarnings || {};
+  const anomalies = report?.quality?.anomalies || [];
   const degradedByModel = Object.entries(modelErrors).filter(([, v]) => Boolean(v)).map(([k]) => k);
-  const degradedPillars = [...new Set([...failedPillars, ...degradedByModel])];
+  const degradedByWarnings = Object.entries(modelWarnings).filter(([, v]) => Array.isArray(v) && v.length > 0).map(([k]) => k);
+  const degradedPillars = [...new Set([...failedPillars, ...degradedByModel, ...degradedByWarnings])];
+  const pillarMeta = {
+    infra: normalizePillarMeta(infraRaw, "infra"),
+    build: normalizePillarMeta(buildRaw, "build"),
+    buyer: normalizePillarMeta(buyerRaw, "buyer"),
+  };
+  const qualityMeta = buildQualityMeta({
+    scannerErrors,
+    modelErrors,
+    modelWarnings,
+    anomalies,
+    pillarMeta,
+    timedOut,
+    fastMode: Boolean(config.fastMode),
+  });
+  const legacyCompleteness = Math.max(0, Math.round(((3 - Math.min(3, degradedPillars.length)) / 3) * 100));
 
   return {
     target: { name, url: domain, logo: name[0] },
     scannedAt: new Date().toISOString(),
     platformsScanned: config.platformsScanned,
     ...report,
+    infraCost: {
+      ...report.infraCost,
+      confidence: {
+        overall: qualityMeta.perPillar.infra.score,
+        level: qualityMeta.perPillar.infra.level,
+      },
+    },
+    buildCost: {
+      ...report.buildCost,
+      confidence: {
+        overall: qualityMeta.perPillar.build.score,
+        level: qualityMeta.perPillar.build.level,
+      },
+    },
+    buyerCost: {
+      ...report.buyerCost,
+      confidence: {
+        overall: qualityMeta.perPillar.buyer.score,
+        level: qualityMeta.perPillar.buyer.level,
+      },
+    },
+    provenance: {
+      infra: {
+        evidenceSources: report?.infraCost?.evidenceSources || [],
+        extractedAt: pillarMeta.infra.extractedAt,
+      },
+      build: {
+        evidenceSources: report?.buildCost?.evidenceSources || [],
+        extractedAt: pillarMeta.build.extractedAt,
+      },
+      buyer: {
+        evidenceSources: report?.buyerCost?.evidenceSources || [],
+        extractedAt: pillarMeta.buyer.extractedAt,
+      },
+    },
     quality: {
-      partialData: degradedPillars.length > 0,
+      partialData: degradedPillars.length > 0 || qualityMeta.confidenceScore.global < 80,
       degradedPillars,
       scannerErrors: timedOut ? { ...scannerErrors, timeout: "Investigation time limit reached; partial report." } : scannerErrors,
       modelErrors,
-      completenessScore: Math.max(0, Math.round(((3 - degradedPillars.length) / 3) * 100)),
+      modelWarnings,
+      anomalies,
+      completenessScore: legacyCompleteness,
+      qualityMeta,
     },
   };
 }
@@ -249,15 +447,37 @@ function getFastAsyncGoals(targetUrl, domain) {
 }
 
 function coerceRunResultToInfra(result) {
-  if (!result || typeof result !== "object") return { techStack: null, traffic: null, thirdParty: null, headcount: null };
+  if (!result || typeof result !== "object") {
+    return { techStack: null, traffic: null, thirdParty: null, headcount: null, _meta: normalizePillarMeta(null, "infra") };
+  }
   const t = result.techStack ?? result;
   const tr = result.traffic ?? null;
-  return { techStack: t && typeof t === "object" ? t : null, traffic: tr && typeof tr === "object" ? tr : null, thirdParty: null, headcount: null };
+  const data = {
+    techStack: t && typeof t === "object" ? t : null,
+    traffic: tr && typeof tr === "object" ? tr : null,
+    thirdParty: null,
+    headcount: null,
+  };
+  return {
+    ...data,
+    _meta: normalizePillarMeta(
+      {
+        _meta: {
+          pillar: "infra",
+          extractedAt: new Date().toISOString(),
+          sourceFamilies: [data.techStack ? "techStack" : null, data.traffic ? "trafficSignals" : null].filter(Boolean),
+        },
+      },
+      "infra"
+    ),
+  };
 }
 
 function coerceRunResultToBuild(result) {
-  if (!result || typeof result !== "object") return { features: { detected: [], pricingPageFeatures: [] }, openSource: [], hiring: null };
-  return {
+  if (!result || typeof result !== "object") {
+    return { features: { detected: [], pricingPageFeatures: [] }, openSource: [], hiring: null, _meta: normalizePillarMeta(null, "build") };
+  }
+  const data = {
     features: {
       detected: Array.isArray(result.detected) ? result.detected : [],
       pricingPageFeatures: Array.isArray(result.pricingPageFeatures) ? result.pricingPageFeatures : [],
@@ -265,16 +485,42 @@ function coerceRunResultToBuild(result) {
     openSource: [],
     hiring: null,
   };
+  return {
+    ...data,
+    _meta: normalizePillarMeta(
+      {
+        _meta: {
+          pillar: "build",
+          extractedAt: new Date().toISOString(),
+          sourceFamilies:
+            data.features.detected.length > 0 || data.features.pricingPageFeatures.length > 0 ? ["features"] : [],
+        },
+      },
+      "build"
+    ),
+  };
 }
 
 function coerceRunResultToBuyer(result) {
-  if (!result || typeof result !== "object") return { pricing: null, reviewInsights: [], limits: [], competitors: [] };
+  if (!result || typeof result !== "object") {
+    return { pricing: null, reviewInsights: [], limits: [], competitors: [], _meta: normalizePillarMeta(null, "buyer") };
+  }
   const p = result.plans;
-  return {
+  const data = {
     pricing: result.plans !== undefined ? { plans: Array.isArray(p) ? p : [], finePrint: result.finePrint || [] } : null,
     reviewInsights: [],
     limits: [],
     competitors: [],
+  };
+  const sourceFamilies = [];
+  if (data.pricing?.plans?.length) sourceFamilies.push("pricing");
+  if (data.pricing?.finePrint?.length) sourceFamilies.push("pricingFinePrint");
+  return {
+    ...data,
+    _meta: normalizePillarMeta(
+      { _meta: { pillar: "buyer", extractedAt: new Date().toISOString(), sourceFamilies } },
+      "buyer"
+    ),
   };
 }
 
@@ -286,12 +532,15 @@ app.post("/api/investigate/async", async (req, res) => {
     const goals = getFastAsyncGoals(targetUrl, domain);
     const tinyfish = new TinyFishWebAgentClient(config.tinyfish);
 
-    const [infraRes, buildRes, buyerRes] = await Promise.all([
+    const [infraRun, buildRun, buyerRun] = await Promise.allSettled([
       tinyfish.runAsync(goals.infra),
       tinyfish.runAsync(goals.build),
       tinyfish.runAsync(goals.buyer),
     ]);
 
+    const infraRes = infraRun.status === "fulfilled" ? infraRun.value : { error: { message: infraRun.reason?.message || "infra run failed" } };
+    const buildRes = buildRun.status === "fulfilled" ? buildRun.value : { error: { message: buildRun.reason?.message || "build run failed" } };
+    const buyerRes = buyerRun.status === "fulfilled" ? buyerRun.value : { error: { message: buyerRun.reason?.message || "buyer run failed" } };
     const runIds = {
       infra: infraRes?.run_id ?? null,
       build: buildRes?.run_id ?? null,
@@ -300,10 +549,13 @@ app.post("/api/investigate/async", async (req, res) => {
     if (infraRes?.error?.message) runIds._infraError = infraRes.error.message;
     if (buildRes?.error?.message) runIds._buildError = buildRes.error.message;
     if (buyerRes?.error?.message) runIds._buyerError = buyerRes.error.message;
-
-    res.json({ runIds, domain, name });
+    if (!runIds.infra && !runIds.build && !runIds.buyer) {
+      return res.status(502).json({ error: "Failed to start async investigation runs.", runIds, domain, name });
+    }
+    const partial = [runIds._infraError, runIds._buildError, runIds._buyerError].some(Boolean);
+    res.status(partial ? 207 : 200).json({ runIds, domain, name, partial });
   } catch (error) {
-    console.error("[NakedSaaS] Async start error:", error);
+    console.error("[CostLens] Async start error:", error);
     sendStructuredError(res, error);
   }
 });
@@ -311,16 +563,23 @@ app.post("/api/investigate/async", async (req, res) => {
 app.post("/api/investigate/async/poll", async (req, res) => {
   try {
     assertRuntimeEnvReady();
+    assertValidAsyncPollPayload(req.body);
     const { runIds, domain, name } = req.body || {};
-    if (!runIds || !domain || !name) {
-      return res.status(400).json({ error: "runIds, domain, and name are required." });
-    }
     const tinyfish = new TinyFishWebAgentClient(config.tinyfish);
 
+    const safeGetRun = async (runId) => {
+      if (!runId) return { status: "FAILED", error: { message: "Missing run id" }, result: null };
+      try {
+        return await tinyfish.getRun(runId);
+      } catch (error) {
+        return { status: "FAILED", error: { message: error?.message || "Run lookup failed" }, result: null };
+      }
+    };
+
     const [infraRun, buildRun, buyerRun] = await Promise.all([
-      runIds.infra ? tinyfish.getRun(runIds.infra) : null,
-      runIds.build ? tinyfish.getRun(runIds.build) : null,
-      runIds.buyer ? tinyfish.getRun(runIds.buyer) : null,
+      safeGetRun(runIds.infra),
+      safeGetRun(runIds.build),
+      safeGetRun(runIds.buyer),
     ]);
 
     const statuses = {
@@ -347,7 +606,26 @@ app.post("/api/investigate/async/poll", async (req, res) => {
     };
     const failedPillars = Object.entries(scannerErrors).filter(([, v]) => Boolean(v)).map(([k]) => k);
     const modelErrors = report?.quality?.modelErrors || {};
-    const degradedPillars = [...new Set([...failedPillars, ...Object.entries(modelErrors).filter(([, v]) => Boolean(v)).map(([k]) => k)])];
+    const modelWarnings = report?.quality?.modelWarnings || {};
+    const anomalies = report?.quality?.anomalies || [];
+    const degradedByModel = Object.entries(modelErrors).filter(([, v]) => Boolean(v)).map(([k]) => k);
+    const degradedByWarnings = Object.entries(modelWarnings).filter(([, v]) => Array.isArray(v) && v.length > 0).map(([k]) => k);
+    const degradedPillars = [...new Set([...failedPillars, ...degradedByModel, ...degradedByWarnings])];
+    const pillarMeta = {
+      infra: normalizePillarMeta(infraRaw, "infra"),
+      build: normalizePillarMeta(buildRaw, "build"),
+      buyer: normalizePillarMeta(buyerRaw, "buyer"),
+    };
+    const qualityMeta = buildQualityMeta({
+      scannerErrors,
+      modelErrors,
+      modelWarnings,
+      anomalies,
+      pillarMeta,
+      timedOut: false,
+      fastMode: true,
+    });
+    const legacyCompleteness = Math.max(0, Math.round(((3 - Math.min(3, degradedPillars.length)) / 3) * 100));
 
     res.json({
       status: "complete",
@@ -356,17 +634,55 @@ app.post("/api/investigate/async/poll", async (req, res) => {
         scannedAt: new Date().toISOString(),
         platformsScanned: config.platformsScanned,
         ...report,
+        infraCost: {
+          ...report.infraCost,
+          confidence: {
+            overall: qualityMeta.perPillar.infra.score,
+            level: qualityMeta.perPillar.infra.level,
+          },
+        },
+        buildCost: {
+          ...report.buildCost,
+          confidence: {
+            overall: qualityMeta.perPillar.build.score,
+            level: qualityMeta.perPillar.build.level,
+          },
+        },
+        buyerCost: {
+          ...report.buyerCost,
+          confidence: {
+            overall: qualityMeta.perPillar.buyer.score,
+            level: qualityMeta.perPillar.buyer.level,
+          },
+        },
+        provenance: {
+          infra: {
+            evidenceSources: report?.infraCost?.evidenceSources || [],
+            extractedAt: pillarMeta.infra.extractedAt,
+          },
+          build: {
+            evidenceSources: report?.buildCost?.evidenceSources || [],
+            extractedAt: pillarMeta.build.extractedAt,
+          },
+          buyer: {
+            evidenceSources: report?.buyerCost?.evidenceSources || [],
+            extractedAt: pillarMeta.buyer.extractedAt,
+          },
+        },
         quality: {
-          partialData: degradedPillars.length > 0,
+          partialData: degradedPillars.length > 0 || qualityMeta.confidenceScore.global < 80,
           degradedPillars,
           scannerErrors,
           modelErrors,
-          completenessScore: Math.max(0, Math.round(((3 - degradedPillars.length) / 3) * 100)),
+          modelWarnings,
+          anomalies,
+          completenessScore: legacyCompleteness,
+          qualityMeta,
         },
       },
     });
   } catch (error) {
-    console.error("[NakedSaaS] Async poll error:", error);
+    console.error("[CostLens] Async poll error:", error);
     sendStructuredError(res, error);
   }
 });
@@ -379,7 +695,7 @@ app.post("/api/investigate", async (req, res) => {
     const report = await runInvestigation({ targetUrl, domain });
     res.json(report);
   } catch (error) {
-    console.error("[NakedSaaS] Error:", error);
+    console.error("[CostLens] Error:", error);
     sendStructuredError(res, error);
   }
 });
@@ -441,11 +757,34 @@ app.post("/api/investigate/stream", async (req, res) => {
       } catch (_) {}
     }
   } catch (error) {
-    console.error("[NakedSaaS] Stream error:", error);
+    console.error("[CostLens] Stream error:", error);
     sendErrorAndEnd(error);
   } finally {
     clearInterval(heartbeatId);
   }
+});
+
+app.use((error, _req, res, _next) => {
+  const status = error?.statusCode || 500;
+  const payload = {
+    error: status >= 500 ? "Internal server error" : error.message || "Request failed",
+  };
+  const originHint = [...getAllowedProdOrigins()];
+  if (status < 500 && originHint.length > 0 && error?.message?.includes("CORS")) {
+    payload.allowedOrigins = originHint;
+  }
+  if (error?.missingEnv) payload.missingEnv = error.missingEnv;
+  if (!res.headersSent) {
+    res.status(status).json(payload);
+  }
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("[CostLens] Unhandled promise rejection:", reason);
+});
+
+process.on("uncaughtException", (error) => {
+  console.error("[CostLens] Uncaught exception:", error);
 });
 
 // Serve client: Vite dev middleware in dev, static files in production
@@ -471,11 +810,11 @@ if (!process.env.VERCEL) {
 
   function tryListen(port) {
     const server = app.listen(port, () => {
-      console.log(`[NakedSaaS] Running on http://localhost:${port}`);
+      console.log(`[CostLens] Running on http://localhost:${port}`);
     });
     server.on("error", (err) => {
       if (err.code === "EADDRINUSE") {
-        console.warn(`[NakedSaaS] Port ${port} in use, trying ${port + 1}...`);
+        console.warn(`[CostLens] Port ${port} in use, trying ${port + 1}...`);
         tryListen(port + 1);
       } else {
         throw err;
@@ -486,3 +825,9 @@ if (!process.env.VERCEL) {
 }
 
 export default app;
+export const __testUtils = {
+  normalizePillarMeta,
+  buildQualityMeta,
+  freshnessBucket,
+  assertValidAsyncPollPayload,
+};

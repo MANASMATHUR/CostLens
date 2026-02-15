@@ -11,14 +11,19 @@ export class BuildCostEstimator {
 
   async scan(targetUrl, options = {}) {
     const fast = options.fast === true;
+    const extractedAt = new Date().toISOString();
     const tasks = fast
       ? [this.detectFeatures(targetUrl)]
       : [this.detectFeatures(targetUrl), this.findOpenSourceComponents(targetUrl), this.getHiringCosts(targetUrl)];
     const results = await Promise.allSettled(tasks);
-    return {
+    const result = {
       features: results[0]?.status === "fulfilled" ? results[0].value : [],
       openSource: !fast && results[1]?.status === "fulfilled" ? results[1].value : [],
       hiring: !fast && results[2]?.status === "fulfilled" ? results[2].value : null,
+    };
+    return {
+      ...result,
+      _meta: this.buildMeta({ pillar: "build", extractedAt, result }),
     };
   }
 
@@ -69,5 +74,27 @@ export class BuildCostEstimator {
   _coerceObject(value, fallback) {
     if (value && typeof value === "object" && !Array.isArray(value)) return value;
     return fallback;
+  }
+
+  buildMeta({ pillar, extractedAt, result }) {
+    const sourceFamilies = [];
+    if (result?.features?.detected?.length || result?.features?.pricingPageFeatures?.length) sourceFamilies.push("features");
+    if (Array.isArray(result?.openSource) && result.openSource.length > 0) sourceFamilies.push("openSource");
+    if (this._hasDataObject(result?.hiring)) sourceFamilies.push("hiringBenchmarks");
+    return {
+      pillar,
+      extractedAt,
+      sourceFamilies,
+      sourceCount: sourceFamilies.length,
+    };
+  }
+
+  _hasDataObject(value) {
+    return Boolean(
+      value &&
+      typeof value === "object" &&
+      !Array.isArray(value) &&
+      Object.keys(value).length > 0
+    );
   }
 }

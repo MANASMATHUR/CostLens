@@ -1,5 +1,5 @@
 // ============================================================
-// TINYFISH WEB AGENT CLIENT — NakedSaaS Edition
+// TINYFISH WEB AGENT CLIENT — CostLens Edition
 // Official run-sse based automation integration
 // ============================================================
 
@@ -10,6 +10,8 @@ export class TinyFishWebAgentClient {
     this.endpoint = (config.endpoint || "https://agent.tinyfish.ai").replace(/\/+$/, "");
     this.apiKey = config.apiKey;
     this.retries = config.retryAttempts || 3;
+    this.requestTimeoutMs = Number(config.requestTimeoutMs) || 25000;
+    this.sseTimeoutMs = Number(config.sseTimeoutMs) || 130000;
     this.browserProfile = config.browserProfile || "stealth";
     const countryCode =
       config.proxyCountryCode && TINYFISH_PROXY_COUNTRY_CODES.includes(config.proxyCountryCode.toUpperCase())
@@ -40,6 +42,7 @@ export class TinyFishWebAgentClient {
         return await this._runSse(payload, onEvent);
       } catch (err) {
         lastErr = err;
+        if (!this._isRetryable(err)) break;
         if (i < this.retries - 1) {
           await new Promise((resolve) => setTimeout(resolve, 1500 * (i + 1)));
         }
@@ -90,14 +93,14 @@ export class TinyFishWebAgentClient {
   }
 
   async _runSse(payload, onEvent) {
-    const response = await fetch(`${this.endpoint}/v1/automation/run-sse`, {
+    const response = await this._fetchWithTimeout(`${this.endpoint}/v1/automation/run-sse`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "X-API-Key": this.apiKey,
       },
       body: JSON.stringify(payload),
-    });
+    }, this.sseTimeoutMs);
 
     if (!response.ok) {
       const bodyText = await response.text().catch(() => "");
@@ -158,7 +161,9 @@ export class TinyFishWebAgentClient {
         if (json.error.code) message += ` (${json.error.code})`;
       }
     } catch (_) {}
-    return new Error(`TinyFish ${status}: ${message}`);
+    const error = new Error(`TinyFish ${status}: ${message}`);
+    error.statusCode = status;
+    return error;
   }
 
   _parseSseChunk(chunk) {
@@ -205,14 +210,14 @@ export class TinyFishWebAgentClient {
     let lastErr;
     for (let i = 0; i < this.retries; i++) {
       try {
-        const response = await fetch(`${this.endpoint}${path}`, {
+        const response = await this._fetchWithTimeout(`${this.endpoint}${path}`, {
           method,
           headers: {
             "Content-Type": "application/json",
             "X-API-Key": this.apiKey,
           },
           ...(body ? { body: JSON.stringify(body) } : {}),
-        });
+        }, this.requestTimeoutMs);
 
         if (!response.ok) {
           const bodyText = await response.text().catch(() => "");
@@ -221,11 +226,35 @@ export class TinyFishWebAgentClient {
         return response.json();
       } catch (error) {
         lastErr = error;
+        if (!this._isRetryable(error)) break;
         if (i < this.retries - 1) {
           await new Promise((resolve) => setTimeout(resolve, 1500 * (i + 1)));
         }
       }
     }
     throw lastErr;
+  }
+
+  async _fetchWithTimeout(url, options, timeoutMs) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(url, { ...options, signal: controller.signal });
+    } catch (error) {
+      if (error?.name === "AbortError") {
+        const timeoutError = new Error(`TinyFish request timed out after ${timeoutMs}ms`);
+        timeoutError.code = "ETIMEDOUT";
+        throw timeoutError;
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  _isRetryable(error) {
+    const statusCode = Number(error?.statusCode);
+    if (statusCode === 401 || statusCode === 403 || statusCode === 404) return false;
+    return true;
   }
 }

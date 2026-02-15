@@ -10,6 +10,8 @@ export const config = {
     proxyEnabled: process.env.TINYFISH_PROXY_ENABLED === "true",
     proxyCountryCode: process.env.TINYFISH_PROXY_COUNTRY_CODE || "",
     retryAttempts: 3,
+    requestTimeoutMs: Number(process.env.TINYFISH_REQUEST_TIMEOUT_MS) || 25000,
+    sseTimeoutMs: Number(process.env.TINYFISH_SSE_TIMEOUT_MS) || 130000,
   },
   openai: {
     apiKey: process.env.OPENAI_API_KEY || "",

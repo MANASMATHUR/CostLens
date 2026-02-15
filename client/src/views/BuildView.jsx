@@ -1,16 +1,25 @@
 import { Panel } from "../components/ui/Panel";
 import { SectionLabel } from "../components/ui/SectionLabel";
 import { DegradedBanner } from "../components/ui/DegradedBanner";
+import { WhyHint } from "../components/ui/WhyHint";
 import { ExpandableRow } from "../components/ui/ExpandableRow";
 import { ConfBadge, ComplexBadge } from "../components/Badges";
 import { fmt, fmtRange } from "../utils/formatting";
 import { colors, space, type } from "../styles/tokens";
 
 export function BuildView({ report, degraded, degradedReason, expandedBuild, setExpandedBuild }) {
+  const confidenceLevel = report.buildCost?.confidence?.level || "low";
+  const confidenceScore = report.buildCost?.confidence?.overall || 0;
+  const provenance = report.provenance?.build || { evidenceSources: [] };
+  const buildHintLines = [
+    `Confidence: ${confidenceScore}% (${confidenceLevel})`,
+    `Sources: ${provenance.evidenceSources?.length > 0 ? provenance.evidenceSources.join(", ") : "none"}`,
+    `Validation warnings: ${report.buildCost.validationWarnings?.length || 0}`,
+  ];
   const cards = [
-    { label: "Total Build Cost", value: fmtRange(report.buildCost.totalEstimate.low, report.buildCost.totalEstimate.high), sub: `Mid: ${fmt(report.buildCost.totalEstimate.mid)}` },
-    { label: "Timeline", value: `${report.buildCost.timeEstimate.low}–${report.buildCost.timeEstimate.high} months`, sub: `Optimal: ${report.buildCost.timeEstimate.mid} months` },
-    { label: "Team Size", value: `${report.buildCost.teamSize.min}–${report.buildCost.teamSize.max} engineers`, sub: `Optimal: ${report.buildCost.teamSize.optimal}` },
+    { label: "Total Build Cost", value: fmtRange(report.buildCost.totalEstimate.low, report.buildCost.totalEstimate.high), sub: `Mid: ${fmt(report.buildCost.totalEstimate.mid)} (estimated)` },
+    { label: "Timeline", value: `${report.buildCost.timeEstimate.low}–${report.buildCost.timeEstimate.high} months`, sub: `Optimal: ${report.buildCost.timeEstimate.mid} months (estimated)` },
+    { label: "Team Size", value: `${report.buildCost.teamSize.min}–${report.buildCost.teamSize.max} engineers`, sub: `Optimal: ${report.buildCost.teamSize.optimal} (estimated)` },
   ];
 
   return (
@@ -20,12 +29,50 @@ export function BuildView({ report, degraded, degradedReason, expandedBuild, set
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(220px,1fr))", gap: space.md }}>
         {cards.map((c) => (
           <Panel key={c.label}>
-            <SectionLabel style={{ marginBottom: 8 }}>{c.label}</SectionLabel>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, gap: 8 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <SectionLabel style={{ marginBottom: 0 }}>{c.label}</SectionLabel>
+                <WhyHint lines={buildHintLines} />
+              </div>
+              <ConfBadge level={confidenceLevel} />
+            </div>
             <div style={{ fontFamily: "'Playfair Display',serif", fontWeight: 900, fontSize: 22, color: colors.accent, lineHeight: 1 }}>{c.value}</div>
             <div style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: type.sizeSm, color: colors.textMuted, marginTop: 4 }}>{c.sub}</div>
           </Panel>
         ))}
       </div>
+
+      <Panel>
+        <SectionLabel style={{ marginBottom: 8 }}>Build Confidence & Sources</SectionLabel>
+        <div style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: type.sizeSm, color: colors.textSecondary, marginBottom: 8 }}>
+          Overall confidence: {confidenceScore}% ({confidenceLevel})
+        </div>
+        {provenance.evidenceSources?.length > 0 && (
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+            {provenance.evidenceSources.map((src) => (
+              <span
+                key={src}
+                style={{
+                  fontFamily: "'IBM Plex Mono',monospace",
+                  fontSize: type.sizeXs,
+                  color: colors.textMuted,
+                  border: `1px solid ${colors.border}`,
+                  borderRadius: 999,
+                  padding: "3px 8px",
+                  background: colors.bg,
+                }}
+              >
+                source: {src}
+              </span>
+            ))}
+          </div>
+        )}
+        {report.buildCost.validationWarnings?.length > 0 && (
+          <div style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: type.sizeXs, color: colors.accent, marginTop: 8 }}>
+            Validation notes: {report.buildCost.validationWarnings.join(" | ")}
+          </div>
+        )}
+      </Panel>
 
       <div>
         <SectionLabel>Module-by-Module Build Estimate</SectionLabel>

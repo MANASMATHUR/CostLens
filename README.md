@@ -1,40 +1,40 @@
-# 🔬 NakedSaaS — Strip Any SaaS Down to Its True Cost
+# CostLens — Analyze Any SaaS Down to Its True Cost
 
-**Three questions. One investigation. Zero hidden fees.**
+**Three questions. One investigation. Complete cost transparency.**
 
-Paste any SaaS URL → NakedSaaS uses TinyFish Web Agent's stealth engine to investigate across 10+ bot-protected platforms and answers three questions no other tool can:
+Paste any SaaS URL and CostLens uses TinyFish Web Agent's stealth engine to investigate across 10+ bot-protected platforms and answers three questions no other tool can:
 
-1. **What does it cost THEM to run?** — Reverse-engineer infrastructure costs, expose true margins
+1. **What does it cost THEM to run?** — Reverse-engineer infrastructure costs, reveal true margins
 2. **What would it cost to BUILD?** — Module-by-module replication estimate with team size and timeline
-3. **What does it ACTUALLY cost YOU?** — Hidden fees, SSO tax, AI add-ons, overage charges, annual lock-in penalties
+3. **What does it ACTUALLY cost YOU?** — Additional fees, SSO surcharges, AI add-ons, overage charges, annual lock-in costs
 
 > **A TinyFish Web Agent by TinyFish Solutions showcase** — demonstrating capabilities impossible without stealth web automation.
 
 ---
 
-## 🎯 The Problem
+## The Problem
 
 SaaS pricing is deliberately opaque:
 
-- **For investors/analysts**: You can't evaluate a SaaS company's margins without knowing their infrastructure costs — but those costs are hidden behind technical complexity
+- **For investors/analysts**: You can't evaluate a SaaS company's margins without knowing their infrastructure costs — but those costs are concealed behind technical complexity
 - **For CTOs**: Build-vs-buy decisions require knowing the true build cost — but nobody can estimate it without deep technical analysis
-- **For buyers**: The price on the pricing page is never the price you pay — hidden fees inflate costs 30-55% for typical teams
+- **For buyers**: The listed price is rarely the full cost — additional fees inflate costs 30-55% for typical teams
 
-**NakedSaaS solves all three.**
+**CostLens solves all three.**
 
 ---
 
-## ✨ The Three Pillars
+## The Three Pillars
 
-### 🔬 Pillar 1: Their Cost (Infrastructure)
+### Pillar 1: Their Cost (Infrastructure)
 Reverse-engineers what the SaaS company actually spends to run:
 - Cloud compute costs (AWS/GCP/Azure) inferred from CDN headers, response patterns, traffic estimates
 - Database costs estimated from API pagination styles and consistency models
 - Third-party service costs from detected client-side SDKs (Segment, Datadog, LaunchDarkly, etc.)
-- Engineering team costs from LinkedIn headcount × Glassdoor/Levels.fyi salary data
+- Engineering team costs from LinkedIn headcount x Glassdoor/Levels.fyi salary data
 - **Output**: Monthly cost range, per-user cost, estimated gross margin
 
-### 🏗️ Pillar 2: Build Cost (Replication)
+### Pillar 2: Build Cost (Replication)
 Estimates what it would cost to build the product from scratch:
 - Feature detection via DOM analysis, network interception, and runtime inspection
 - Complexity scoring per module (editor, real-time, auth, search, API, mobile, etc.)
@@ -42,101 +42,90 @@ Estimates what it would cost to build the product from scratch:
 - Open-source component identification to reduce build effort
 - **Output**: Total cost range, timeline, team size, module-by-module breakdown
 
-### 💸 Pillar 3: Your Cost (True TCO)
-Uncovers hidden costs the pricing page doesn't show:
-- SSO tax (enterprise-only SSO forcing tier upgrades)
+### Pillar 3: Your Cost (True TCO)
+Uncovers costs the pricing page doesn't show:
+- SSO surcharges (enterprise-only SSO forcing tier upgrades)
 - AI add-on costs not included in base pricing
-- Annual vs monthly billing penalties
+- Annual vs monthly billing differentials
 - Minimum seat commitments on enterprise plans
-- Overage charges mined from G2 reviews and help docs
+- Overage charges identified from G2 reviews and help docs
 - **Output**: Plan-by-plan true cost, TCO scenarios, competitor comparison
 
 ---
 
-## 🛡️ Why Only TinyFish Web Agent Can Do This
+## Why Only TinyFish Web Agent Can Do This
 
-| Data Source | Traditional Tools | ChatGPT | **TinyFish Web Agent + NakedSaaS** |
+| Data Source | Traditional Tools | ChatGPT | **TinyFish Web Agent + CostLens** |
 |---|---|---|---|
-| CF-protected pricing pages | ❌ Blocked | ❌ Stale data | ✅ Stealth rendering |
-| LinkedIn engineering headcount | ❌ Blocked | ❌ No access | ✅ Authenticated sessions |
-| Glassdoor/Levels.fyi salaries | ❌ Bot-protected | ❌ Outdated | ✅ Stealth browsing |
-| Cloudflare Radar traffic data | ❌ Protected API | ❌ No access | ✅ Full page rendering |
-| G2 review mining | ❌ Anti-scrape | ❌ | ✅ Bot protection bypass |
-| Runtime JS analysis | ❌ No browser | ❌ No execution | ✅ Real browser context |
-| Network request interception | ❌ Impossible | ❌ | ✅ Full Performance API |
+| CF-protected pricing pages | Blocked | Stale data | Stealth rendering |
+| LinkedIn engineering headcount | Blocked | No access | Authenticated sessions |
+| Glassdoor/Levels.fyi salaries | Bot-protected | Outdated | Stealth browsing |
+| Cloudflare Radar traffic data | Protected API | No access | Full page rendering |
+| G2 review mining | Anti-scrape | N/A | Bot protection bypass |
+| Runtime JS analysis | No browser | No execution | Real browser context |
+| Network request interception | Impossible | N/A | Full Performance API |
 
 ---
 
-## 🏗 Architecture
+## Architecture
 
 ```
-┌────────────────────────────────────────────┐
-│            FRONTEND (React + Vite)          │
-│   URL Input → Scan → Three-Pillar Report   │
-└──────────────────┬─────────────────────────┘
-                   │ REST / SSE
-┌──────────────────▼─────────────────────────┐
-│             BACKEND (Node.js)               │
-│                                             │
-│  ┌─────────────┐ ┌────────────┐ ┌────────┐│
-│  │ Infra Cost  │ │ Build Cost │ │ Buyer  ││
-│  │ Scanner     │ │ Estimator  │ │ Analyzer││
-│  └──────┬──────┘ └─────┬──────┘ └───┬────┘│
-│         └───────┬──────┘─────────────┘     │
-│                 ▼                           │
-│  ┌──────────────────────────────────────┐  │
-│  │      AI COST MODELER (OpenAI)        │  │
-│  │  Synthesizes signals into report     │  │
-│  └──────────────────────────────────────┘  │
-└──────────────────┬─────────────────────────┘
-                   │ TinyFish REST API
-┌──────────────────▼─────────────────────────┐
-│      TINYFISH WEB AGENT ENGINE              │
-│  Crawls 10+ bot-protected platforms:       │
-│  Target site, GitHub, LinkedIn, Glassdoor, │
-│  Levels.fyi, Cloudflare Radar, SimilarWeb, │
-│  G2, Reddit, AWS Calculator                │
-└────────────────────────────────────────────┘
++-------------------------------------------------+
+|            FRONTEND (React + Vite)               |
+|   URL Input -> Scan -> Three-Pillar Report       |
++-------------------------+-----------------------+
+                          | REST / SSE
++-------------------------v-----------------------+
+|             BACKEND (Node.js)                    |
+|                                                  |
+|  +-------------+ +------------+ +--------+       |
+|  | Infra Cost  | | Build Cost | | Buyer  |       |
+|  | Scanner     | | Estimator  | | Analyzer|      |
+|  +------+------+ +-----+------+ +---+----+      |
+|         +-------+-------+-----------+            |
+|                 v                                 |
+|  +------------------------------------------+   |
+|  |      AI COST MODELER (OpenAI)             |   |
+|  |  Synthesizes signals into report          |   |
+|  +------------------------------------------+   |
++-------------------------+-----------------------+
+                          | TinyFish REST API
++-------------------------v-----------------------+
+|      TINYFISH WEB AGENT ENGINE                   |
+|  Crawls 10+ bot-protected platforms:             |
+|  Target site, GitHub, LinkedIn, Glassdoor,       |
+|  Levels.fyi, Cloudflare Radar, SimilarWeb,       |
+|  G2, Reddit, AWS Calculator                      |
++-------------------------------------------------+
 ```
 
 ---
 
-## 🚀 Getting Started
+## Getting Started
 
 ```bash
 # Clone
-git clone https://github.com/tinyfishsolutions/nakedsaas.git && cd nakedsaas
+git clone <your-repo-url> && cd costlens
 
-# Install app dependencies from root
+# Install dependencies
 npm install
-npm run install:all
 
-# Backend env
-cp backend/.env.example backend/.env
-# Edit backend/.env with TINYFISH_API_KEY and OPENAI_API_KEY
+# Set up environment
+cp .env.example .env
+# Edit .env with TINYFISH_API_KEY and OPENAI_API_KEY
 
-# Run both backend + frontend from root
+# Run
 npm run dev
 
-# Open http://localhost:5173
+# Open http://localhost:3000
 ```
 
 Enter a SaaS URL and click **Investigate** to run a live TinyFish-backed scan.
 
-### Alternative: run services separately
-
-```bash
-# Terminal 1
-npm run dev:backend
-
-# Terminal 2
-npm run dev:frontend
-```
-
 ### Vercel deployment notes
 
 - This repo is configured for a single Vercel project:
-  - Frontend static output: `frontend/dist`
+  - Frontend static output: `client/dist`
   - Backend API routes: `/api/*` (serverless function)
 - Required Vercel environment variables:
   - `TINYFISH_API_KEY`
@@ -167,36 +156,35 @@ This project follows TinyFish official docs with:
 
 ---
 
-## 📁 Project Structure
+## Project Structure
 
 ```
-nakedsaas/
-├── frontend/
+costlens/
+├── client/
 │   ├── src/App.jsx              # Full dashboard (three-pillar UI)
 │   ├── src/main.jsx
 │   ├── index.html
-│   ├── vite.config.js
-│   └── package.json
-├── backend/
-│   ├── src/
-│   │   ├── server.js            # Express API + SSE streaming
-│   │   ├── config/index.js
-│   │   ├── tinyfish/tinyfish-web-agent-client.js  # TinyFish Web Agent client
-│   │   ├── services/
-│   │   │   ├── infra-cost-scanner.js    # Pillar 1: Their cost
-│   │   │   ├── build-cost-estimator.js  # Pillar 2: Build cost
-│   │   │   └── buyer-cost-analyzer.js   # Pillar 3: Your cost
-│   │   └── analysis/
-│   │       └── cost-modeler.js  # AI synthesis (OpenAI)
-│   ├── .env.example
-│   └── package.json
-└── docs/
-    └── BUSINESS.md
+│   └── ...
+├── server/
+│   ├── server.js                # Express API + SSE streaming
+│   ├── config/index.js
+│   ├── tinyfish/tinyfish-web-agent-client.js  # TinyFish Web Agent client
+│   ├── services/
+│   │   ├── infra-cost-scanner.js    # Pillar 1: Their cost
+│   │   ├── build-cost-estimator.js  # Pillar 2: Build cost
+│   │   └── buyer-cost-analyzer.js   # Pillar 3: Your cost
+│   └── analysis/
+│       └── cost-modeler.js          # AI synthesis (OpenAI)
+├── docs/
+│   └── BUSINESS.md
+├── .env.example
+├── package.json
+└── vercel.json
 ```
 
 ---
 
-## 💰 Business Model
+## Business Model
 
 | Tier | Price | Scans | Features |
 |------|-------|-------|----------|
@@ -209,7 +197,7 @@ nakedsaas/
 
 ---
 
-## 📄 License
+## License
 
 Proprietary — TinyFish Solutions. All rights reserved.
 
@@ -217,5 +205,5 @@ Proprietary — TinyFish Solutions. All rights reserved.
 
 <p align="center">
   <strong>Built with <a href="https://agent.tinyfish.ai">TinyFish Web Agent</a> by TinyFish Solutions</strong><br>
-  <em>The price on the page is never the price you pay.</em>
+  <em>Complete SaaS cost intelligence, powered by stealth web automation.</em>
 </p>

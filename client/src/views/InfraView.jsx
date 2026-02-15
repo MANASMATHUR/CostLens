@@ -1,6 +1,7 @@
 import { Panel } from "../components/ui/Panel";
 import { SectionLabel } from "../components/ui/SectionLabel";
 import { DegradedBanner } from "../components/ui/DegradedBanner";
+import { WhyHint } from "../components/ui/WhyHint";
 import { ExpandableRow } from "../components/ui/ExpandableRow";
 import { MarginGauge, CostBar } from "../components/InfraVisualizations";
 import { ConfBadge } from "../components/Badges";
@@ -10,6 +11,14 @@ import { colors, space, type } from "../styles/tokens";
 export function InfraView({ report, degraded, degradedReason, expandedInfra, setExpandedInfra }) {
   const items = report.infraCost.breakdown;
   const signals = report.infraCost.signals;
+  const provenance = report.provenance?.infra || { evidenceSources: [] };
+  const confidenceLevel = report.infraCost?.confidence?.level || "low";
+  const confidenceScore = report.infraCost?.confidence?.overall || 0;
+  const infraHintLines = [
+    `Confidence: ${confidenceScore}% (${confidenceLevel})`,
+    `Sources: ${provenance.evidenceSources?.length > 0 ? provenance.evidenceSources.join(", ") : "none"}`,
+    `Validation warnings: ${report.infraCost.validationWarnings?.length || 0}`,
+  ];
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: space.lg, animation: "fadeUp 0.4s ease" }}>
@@ -17,15 +26,29 @@ export function InfraView({ report, degraded, degradedReason, expandedInfra, set
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(260px,1fr))", gap: space.md }}>
         <Panel style={{ padding: 24 }}>
-          <SectionLabel style={{ marginBottom: 12 }}>Estimated Gross Margin</SectionLabel>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 12 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <SectionLabel>Estimated Gross Margin</SectionLabel>
+              <WhyHint lines={infraHintLines} />
+            </div>
+            <ConfBadge level={confidenceLevel} />
+          </div>
           <MarginGauge {...report.infraCost.grossMargin} />
         </Panel>
         <Panel style={{ padding: 24 }}>
-          <SectionLabel style={{ marginBottom: 12 }}>Monthly Infrastructure Cost</SectionLabel>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 12 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <SectionLabel>Monthly Infrastructure Cost</SectionLabel>
+              <WhyHint lines={infraHintLines} />
+            </div>
+            <span style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: type.sizeXs, color: colors.textMuted }}>{confidenceScore}% confidence</span>
+          </div>
           <div style={{ fontFamily: "'Playfair Display',serif", fontWeight: 900, fontSize: 32, color: colors.accent, marginBottom: 4 }}>
             {fmtRange(report.infraCost.monthlyEstimate.low, report.infraCost.monthlyEstimate.high)}
           </div>
-          <div style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: type.sizeMd, color: colors.textSecondary, marginBottom: 12 }}>Mid estimate: {fmt(report.infraCost.monthlyEstimate.mid)}/mo</div>
+          <div style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: type.sizeMd, color: colors.textSecondary, marginBottom: 12 }}>
+            Mid estimate: {fmt(report.infraCost.monthlyEstimate.mid)}/mo (estimated)
+          </div>
           <SectionLabel style={{ marginBottom: 6 }}>Per-user Cost</SectionLabel>
           <div style={{ fontFamily: "'Playfair Display',serif", fontWeight: 700, fontSize: 20 }}>
             ${report.infraCost.perUserEstimate.low}–${report.infraCost.perUserEstimate.high}
@@ -36,6 +59,31 @@ export function InfraView({ report, degraded, degradedReason, expandedInfra, set
 
       <Panel style={{ padding: 24 }}>
         <SectionLabel style={{ marginBottom: 14 }}>Infrastructure Cost Breakdown</SectionLabel>
+        {provenance.evidenceSources?.length > 0 && (
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
+            {provenance.evidenceSources.map((src) => (
+              <span
+                key={src}
+                style={{
+                  fontFamily: "'IBM Plex Mono',monospace",
+                  fontSize: type.sizeXs,
+                  color: colors.textMuted,
+                  border: `1px solid ${colors.border}`,
+                  borderRadius: 999,
+                  padding: "3px 8px",
+                  background: colors.bg,
+                }}
+              >
+                source: {src}
+              </span>
+            ))}
+          </div>
+        )}
+        {report.infraCost.validationWarnings?.length > 0 && (
+          <div style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: type.sizeXs, color: colors.accent, marginBottom: 10 }}>
+            Validation notes: {report.infraCost.validationWarnings.join(" | ")}
+          </div>
+        )}
         {items.length > 0 ? <CostBar items={items} /> : <div style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: type.sizeSm, color: colors.textMuted }}>No breakdown data available for this scan.</div>}
       </Panel>
 

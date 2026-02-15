@@ -11,6 +11,7 @@ export class BuyerCostAnalyzer {
 
   async scan(targetUrl, options = {}) {
     const fast = options.fast === true;
+    const extractedAt = new Date().toISOString();
     const tasks = fast
       ? [this.extractPricing(targetUrl)]
       : [
@@ -20,11 +21,15 @@ export class BuyerCostAnalyzer {
           this.extractCompetitorSignals(targetUrl),
         ];
     const results = await Promise.allSettled(tasks);
-    return {
+    const result = {
       pricing: results[0]?.status === "fulfilled" ? results[0].value : null,
       reviewInsights: !fast && results[1]?.status === "fulfilled" ? results[1].value : [],
       limits: !fast && results[2]?.status === "fulfilled" ? results[2].value : [],
       competitors: !fast && results[3]?.status === "fulfilled" ? results[3].value : [],
+    };
+    return {
+      ...result,
+      _meta: this.buildMeta({ pillar: "buyer", extractedAt, result }),
     };
   }
 
@@ -86,5 +91,25 @@ export class BuyerCostAnalyzer {
   _coerceObject(value, fallback) {
     if (value && typeof value === "object" && !Array.isArray(value)) return value;
     return fallback;
+  }
+
+  buildMeta({ pillar, extractedAt, result }) {
+    const sourceFamilies = [];
+    if (result?.pricing?.plans?.length) sourceFamilies.push("pricing");
+    if (result?.pricing?.finePrint?.length) sourceFamilies.push("pricingFinePrint");
+    if (
+      (Array.isArray(result?.reviewInsights?.g2) && result.reviewInsights.g2.length > 0) ||
+      (Array.isArray(result?.reviewInsights?.reddit) && result.reviewInsights.reddit.length > 0)
+    ) {
+      sourceFamilies.push("reviews");
+    }
+    if (Array.isArray(result?.limits) && result.limits.length > 0) sourceFamilies.push("limitsDocs");
+    if (Array.isArray(result?.competitors) && result.competitors.length > 0) sourceFamilies.push("competitors");
+    return {
+      pillar,
+      extractedAt,
+      sourceFamilies,
+      sourceCount: sourceFamilies.length,
+    };
   }
 }

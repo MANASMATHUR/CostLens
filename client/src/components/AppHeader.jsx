@@ -34,26 +34,28 @@ export function AppHeader({ hasResults, view, onViewChange, tabMeta, degradedSet
             letterSpacing: "-0.5px",
           }}
         >
-          NS
+          CL
         </div>
         <div>
-          <div style={{ fontFamily: "'Playfair Display',serif", fontWeight: 900, fontSize: 17, letterSpacing: "-0.02em", lineHeight: 1.1, color: colors.text }}>NakedSaaS</div>
-          <div style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: 9, color: colors.textMuted, letterSpacing: "0.06em", textTransform: "uppercase" }}>Strip any SaaS to its true cost</div>
+          <div style={{ fontFamily: "'Playfair Display',serif", fontWeight: 900, fontSize: 17, letterSpacing: "-0.02em", lineHeight: 1.1, color: colors.text }}>CostLens</div>
+          <div style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: 9, color: colors.textMuted, letterSpacing: "0.06em", textTransform: "uppercase" }}>Analyze any SaaS down to its true cost</div>
         </div>
       </div>
       {hasResults && (
         <div style={{ display: "flex", border: `1px solid ${colors.borderStrong}`, borderRadius: radius.sm, overflow: "hidden", flexWrap: "wrap" }} role="tablist" aria-label="Report pillars">
-          {tabMeta.map(([id, label]) => (
+          {tabMeta.map(([id, label], idx) => (
             <button
               key={id}
               type="button"
               role="tab"
+              id={`tab-${id}`}
+              aria-controls={`panel-${id}`}
               aria-selected={view === id}
               onClick={() => onViewChange(id)}
               style={{
                 padding: "6px 16px",
                 border: "none",
-                borderRight: `1px solid ${colors.borderStrong}`,
+                borderRight: idx < tabMeta.length - 1 ? `1px solid ${colors.borderStrong}` : "none",
                 background: view === id ? colors.accent : "transparent",
                 color: view === id ? "#fff" : colors.textSecondary,
                 fontFamily: "'IBM Plex Mono',monospace",

@@ -36,7 +36,7 @@ export default function App() {
     "Crawling Cloudflare Radar for traffic estimates...",
     "Scanning LinkedIn for engineering headcount...",
     "Extracting salary data from Glassdoor...",
-    "Analyzing pricing page for hidden costs...",
+    "Analyzing pricing page for additional costs...",
     "Cross-referencing G2 reviews for overage complaints...",
     "Checking Crunchbase for revenue estimates...",
     "Estimating infrastructure costs via AWS Calculator...",
@@ -45,6 +45,35 @@ export default function App() {
 
   const POLL_INTERVAL_MS = 3500;
   const POLL_TIMEOUT_MS = 5 * 60 * 1000; // 5 min max polling (TinyFish runs async on their side)
+  const REQUEST_TIMEOUT_MS = 20000;
+
+  const fetchJsonWithTimeout = useCallback(async (url, options = {}, timeoutMs = REQUEST_TIMEOUT_MS) => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(url, { ...options, signal: controller.signal });
+      if (!response.ok) {
+        const raw = await response.text().catch(() => "");
+        let parsed = {};
+        try {
+          parsed = raw ? JSON.parse(raw) : {};
+        } catch (_) {}
+        throw new Error(parsed?.error || response.statusText || "Request failed");
+      }
+      try {
+        return await response.json();
+      } catch (_) {
+        throw new Error("Server returned an invalid JSON response.");
+      }
+    } catch (error) {
+      if (error?.name === "AbortError") {
+        throw new Error("Request timed out. Please retry.");
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }, []);
 
   const runScan = useCallback(async () => {
     const target = url.trim();
@@ -59,16 +88,12 @@ export default function App() {
     setScanPlatforms(["Target Site", "GitHub", "LinkedIn", "Glassdoor", "Levels.fyi", "AWS Calculator", "Cloudflare Radar", "SimilarWeb", "G2", "Reddit"]);
 
     try {
-      const startRes = await fetch("/api/investigate/async", {
+      const startData = await fetchJsonWithTimeout("/api/investigate/async", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url: target }),
       });
-      if (!startRes.ok) {
-        const data = await startRes.json().catch(() => ({}));
-        throw new Error(data?.error || startRes.statusText || "Failed to start investigation.");
-      }
-      const { runIds, domain, name } = await startRes.json();
+      const { runIds, domain, name } = startData;
       if (!runIds?.infra && !runIds?.build && !runIds?.buyer) {
         throw new Error("No run IDs returned. Check API keys and try again.");
       }
@@ -78,18 +103,25 @@ export default function App() {
 
       const pollStart = Date.now();
       let lastProgress = 15;
+      let pollFailures = 0;
       while (Date.now() - pollStart < POLL_TIMEOUT_MS) {
         await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
-        const pollRes = await fetch("/api/investigate/async/poll", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ runIds, domain, name }),
-        });
-        if (!pollRes.ok) {
-          const data = await pollRes.json().catch(() => ({}));
-          throw new Error(data?.error || "Poll failed.");
+        let data;
+        try {
+          data = await fetchJsonWithTimeout("/api/investigate/async/poll", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ runIds, domain, name }),
+          });
+          pollFailures = 0;
+        } catch (pollError) {
+          pollFailures += 1;
+          if (pollFailures >= 3) {
+            throw new Error(pollError?.message || "Poll failed repeatedly.");
+          }
+          setAction(`Transient poll issue (${pollFailures}/3), retrying...`);
+          continue;
         }
-        const data = await pollRes.json();
         if (data.status === "complete") {
           setProgress(100);
           setAction("Investigation complete");
@@ -110,7 +142,7 @@ export default function App() {
     } finally {
       setScanning(false);
     }
-  }, [scanning, url]);
+  }, [fetchJsonWithTimeout, scanning, url]);
 
   const hasResults = Boolean(results);
   const R = normalizeReport(results);
@@ -155,32 +187,40 @@ export default function App() {
 
         {hasResults && (
           <div style={{ display: "flex", flexDirection: "column", gap: space.lg }}>
-            <ReportSummary report={R} />
+            <ReportSummary report={R} activePillar={view || "infra"} />
             {view === "infra" && (
-              <InfraView
-                report={R}
-                degraded={degradedSet.has("infra")}
-                degradedReason={degradedReason}
-                expandedInfra={expandedInfra}
-                setExpandedInfra={setExpandedInfra}
-              />
+              <section role="tabpanel" id="panel-infra" aria-labelledby="tab-infra">
+                <InfraView
+                  report={R}
+                  degraded={degradedSet.has("infra")}
+                  degradedReason={degradedReason}
+                  expandedInfra={expandedInfra}
+                  setExpandedInfra={setExpandedInfra}
+                />
+              </section>
             )}
             {view === "build" && (
-              <BuildView
-                report={R}
-                degraded={degradedSet.has("build")}
-                degradedReason={degradedReason}
-                expandedBuild={expandedBuild}
-                setExpandedBuild={setExpandedBuild}
-              />
+              <section role="tabpanel" id="panel-build" aria-labelledby="tab-build">
+                <BuildView
+                  report={R}
+                  degraded={degradedSet.has("build")}
+                  degradedReason={degradedReason}
+                  expandedBuild={expandedBuild}
+                  setExpandedBuild={setExpandedBuild}
+                />
+              </section>
             )}
-            {view === "buyer" && <BuyerView report={R} degraded={degradedSet.has("buyer")} degradedReason={degradedReason} />}
+            {view === "buyer" && (
+              <section role="tabpanel" id="panel-buyer" aria-labelledby="tab-buyer">
+                <BuyerView report={R} degraded={degradedSet.has("buyer")} degradedReason={degradedReason} />
+              </section>
+            )}
           </div>
         )}
       </main>
 
       <footer style={{ borderTop: `1px solid ${colors.border}`, padding: `14px ${space.xxxl}px`, display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
-        <span style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: 10, color: colors.textMuted }}>NakedSaaS v1.0 — A TinyFish Web Agent by TinyFish Solutions showcase</span>
+        <span style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: 10, color: colors.textMuted }}>CostLens v1.0 — Powered by TinyFish Web Agent</span>
         <span style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: 10, color: colors.textMuted }}>Data is estimated. Not financial advice.</span>
       </footer>
     </div>

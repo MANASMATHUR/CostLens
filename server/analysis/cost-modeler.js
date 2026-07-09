@@ -1,27 +1,37 @@
-// ============================================================
-// AI COST MODELER
-// Synthesizes data from all three scanners using OpenAI
-// to generate the final cost intelligence report
-// ============================================================
-
 import OpenAI from "openai";
+import { buildEvidenceContext } from "./evidence.js";
+
+const CITATION_SCHEMA = `"citations": [{ "source": string, "url": string|null, "snippet": string, "confidence": "high"|"medium"|"low" }]`;
 
 export class CostModeler {
-  constructor(config) {
+  constructor(config = {}) {
     this.openai = new OpenAI({ apiKey: config.apiKey });
     this.model = config.model || "gpt-4o";
+    this.summaryModel = config.summaryModel || this.model;
+    this.temperature = config.temperature ?? 0.2;
+    this.retries = config.retries ?? 2;
+    this.maxTokens = config.maxTokens || {};
+    this.quality = config.quality || {};
+    this.bounds = config.bounds || {};
   }
 
-  async analyze(infraData, buildData, buyerData, targetInfo) {
+  async analyze(infraData, buildData, buyerData, targetInfo, enrichment = null) {
+    const context = {
+      infra: buildEvidenceContext(infraData, targetInfo.url),
+      build: buildEvidenceContext(buildData, targetInfo.url),
+      buyer: buildEvidenceContext(buyerData, targetInfo.url),
+    };
+
     const [infraRes, buildRes, buyerRes] = await Promise.allSettled([
-      this.analyzeInfraCosts(infraData, targetInfo),
-      this.analyzeBuildCosts(buildData, targetInfo),
-      this.analyzeBuyerCosts(buyerData, targetInfo),
+      this.analyzeInfraCosts(infraData, targetInfo, context.infra, enrichment),
+      this.analyzeBuildCosts(buildData, targetInfo, context.build, enrichment),
+      this.analyzeBuyerCosts(buyerData, targetInfo, context.buyer, enrichment),
     ]);
 
-    const infraCost = infraRes.status === "fulfilled" ? infraRes.value : this.getDefaultInfraCost();
-    const buildCost = buildRes.status === "fulfilled" ? buildRes.value : this.getDefaultBuildCost();
-    const buyerCost = buyerRes.status === "fulfilled" ? buyerRes.value : this.getDefaultBuyerCost();
+    const infraCost = infraRes.status === "fulfilled" ? infraRes.value : this.getDefaultInfraCost(context.infra);
+    const buildCost = buildRes.status === "fulfilled" ? buildRes.value : this.getDefaultBuildCost(context.build);
+    const buyerCost = buyerRes.status === "fulfilled" ? buyerRes.value : this.getDefaultBuyerCost(context.buyer);
+
     const crossValidation = this.crossValidateAgainstSignals({
       infraCost,
       buildCost,
@@ -29,6 +39,7 @@ export class CostModeler {
       infraData,
       buildData,
       buyerData,
+      enrichment,
     });
 
     infraCost.validationWarnings = [...new Set([...(infraCost.validationWarnings || []), ...crossValidation.infraWarnings])];
@@ -56,106 +67,161 @@ export class CostModeler {
     };
   }
 
-  async analyzeInfraCosts(data, target) {
+  async analyzeInfraCosts(data, target, evidence, enrichment) {
     const parsed = await this.requestJsonWithRetry({
+      model: this.model,
       messages: [
         {
           role: "system",
-          content: `You are an expert cloud infrastructure cost analyst. Given technical signals from a SaaS product, estimate monthly infrastructure costs.
-Return strict JSON only:
+          content: `You are an expert cloud infrastructure cost analyst. Estimate monthly infrastructure costs from scanner evidence only.
+Rules:
+- Never invent traffic, headcount, or vendor data that is absent from the input.
+- Every breakdown item must cite a concrete signal in evidence text.
+- If evidence is sparse, use low confidence, keep ranges wide, and set revenueEstimate to 0.
+Return strict JSON:
 {
   "monthlyEstimate": { "low": number, "mid": number, "high": number },
   "perUserEstimate": { "low": number, "mid": number, "high": number },
   "revenueEstimate": number,
   "grossMargin": { "low": number, "mid": number, "high": number },
   "breakdown": [{ "category": string, "estimate": string, "confidence": "high"|"medium"|"low", "evidence": string, "pct": number }],
-  "signals": [{ "icon": string, "text": string }]
-}
-If data is sparse, return conservative values and explain uncertainty in evidence text.`,
+  "signals": [{ "icon": string, "text": string }],
+  ${CITATION_SCHEMA},
+  "limitations": [string]
+}`,
         },
         {
           role: "user",
-          content: `Analyze infrastructure costs for ${target.name} (${target.url}):
-Tech Stack: ${JSON.stringify(data?.techStack || {})}
-Traffic Data: ${JSON.stringify(data?.traffic || {})}
-Third-Party Services: ${JSON.stringify(data?.thirdParty || [])}
-Engineering Headcount: ${JSON.stringify(data?.headcount || {})}`,
+          content: this.buildUserPrompt({
+            title: `Infrastructure costs for ${target.name} (${target.url})`,
+            evidence,
+            enrichment: enrichment?.infra,
+            payload: {
+              techStack: data?.techStack || {},
+              traffic: data?.traffic || {},
+              thirdParty: data?.thirdParty || [],
+              headcount: data?.headcount || {},
+            },
+          }),
         },
       ],
-      maxTokens: 2000,
+      maxTokens: this.maxTokens.infra || 2500,
     });
 
-    return this.normalizeInfraCost(parsed);
+    return this.normalizeInfraCost(parsed, evidence);
   }
 
-  async analyzeBuildCosts(data, target) {
+  async analyzeBuildCosts(data, target, evidence, enrichment) {
     const parsed = await this.requestJsonWithRetry({
+      model: this.model,
       messages: [
         {
           role: "system",
-          content: `You are an expert software development cost estimator. Given detected features and tech stack, estimate build cost from scratch.
-Return strict JSON only:
+          content: `You are an expert software development cost estimator. Estimate build-from-scratch cost using detected features and hiring signals only.
+Rules:
+- Tie each module estimate to named detected features when possible.
+- Do not assume enterprise scale without feature evidence.
+- If feature evidence is missing, keep totals conservative and explain gaps in limitations.
+Return strict JSON:
 {
   "totalEstimate": { "low": number, "mid": number, "high": number },
   "timeEstimate": { "low": number, "mid": number, "high": number },
   "teamSize": { "min": number, "optimal": number, "max": number },
   "breakdown": [{ "module": string, "effort": string, "cost": string, "complexity": "extreme"|"hard"|"medium", "notes": string }],
-  "techStack": [{ "layer": string, "tech": string, "detected": boolean, "confidence": "high"|"medium"|"low" }]
-}
-Use conservative assumptions if source data is weak.`,
+  "techStack": [{ "layer": string, "tech": string, "detected": boolean, "confidence": "high"|"medium"|"low" }],
+  ${CITATION_SCHEMA},
+  "limitations": [string]
+}`,
         },
         {
           role: "user",
-          content: `Estimate build cost for ${target.name} (${target.url}):
-Detected Features: ${JSON.stringify(data?.features || {})}
-Open Source Components: ${JSON.stringify(data?.openSource || [])}
-Market Salary Data: ${JSON.stringify(data?.hiring || {})}`,
+          content: this.buildUserPrompt({
+            title: `Build cost for ${target.name} (${target.url})`,
+            evidence,
+            enrichment: enrichment?.build,
+            payload: {
+              features: data?.features || {},
+              openSource: data?.openSource || [],
+              hiring: data?.hiring || {},
+            },
+          }),
         },
       ],
-      maxTokens: 2500,
+      maxTokens: this.maxTokens.build || 3000,
     });
 
-    return this.normalizeBuildCost(parsed);
+    return this.normalizeBuildCost(parsed, evidence);
   }
 
-  async analyzeBuyerCosts(data, target) {
+  async analyzeBuyerCosts(data, target, evidence, enrichment) {
     const parsed = await this.requestJsonWithRetry({
+      model: this.model,
       messages: [
         {
           role: "system",
-          content: `You are a SaaS procurement analyst uncovering hidden costs.
-Return strict JSON only:
+          content: `You are a SaaS procurement analyst uncovering true buyer cost, hidden fees, and TCO deltas.
+Rules:
+- Distinguish listed price vs realistic monthly cost.
+- Surface gotchas only when supported by pricing, review, or limits evidence.
+- Do not fabricate competitor pricing; mark unknown values explicitly.
+Return strict JSON:
 {
   "plans": [{ "name": string, "listed": string, "actualMonthly": string, "gotchas": [string], "hiddenCosts": [{ "item": string, "cost": string, "note": string }] }],
   "tcoComparison": [{ "scenario": string, "monthlyListed": string, "monthlyActual": string, "annualDelta": string, "note": string }],
-  "competitorComparison": [{ "name": string, "cost": string, "features": string }]
-}
-If competitor data is unavailable, still provide a reasonable comparison set with explicit uncertainty in notes.`,
+  "competitorComparison": [{ "name": string, "cost": string, "features": string }],
+  ${CITATION_SCHEMA},
+  "limitations": [string]
+}`,
         },
         {
           role: "user",
-          content: `Analyze true buyer costs for ${target.name} (${target.url}):
-Pricing Data: ${JSON.stringify(data?.pricing || {})}
-Review Insights: ${JSON.stringify(data?.reviewInsights || {})}
-Documented Limits: ${JSON.stringify(data?.limits || [])}
-Competitor Insights: ${JSON.stringify(data?.competitors || [])}`,
+          content: this.buildUserPrompt({
+            title: `Buyer cost for ${target.name} (${target.url})`,
+            evidence,
+            enrichment: enrichment?.buyer,
+            payload: {
+              pricing: data?.pricing || {},
+              reviewInsights: data?.reviewInsights || {},
+              limits: data?.limits || [],
+              competitors: data?.competitors || [],
+            },
+          }),
         },
       ],
-      maxTokens: 2000,
+      maxTokens: this.maxTokens.buyer || 2500,
     });
 
-    return this.normalizeBuyerCost(parsed);
+    return this.normalizeBuyerCost(parsed, evidence);
   }
 
-  async requestJsonWithRetry({ messages, maxTokens, retries = 2 }) {
+  buildUserPrompt({ title, evidence, enrichment, payload }) {
+    return `${title}
+Evidence context: ${JSON.stringify(evidence)}
+Derived signal counts: ${JSON.stringify(enrichment || {})}
+Raw scanner payload: ${JSON.stringify(payload)}`;
+  }
+
+  async requestJsonWithRetry({ messages, maxTokens, model = this.model, retries = this.retries }) {
     let lastError = null;
+    let repairContent = null;
 
     for (let attempt = 0; attempt <= retries; attempt++) {
       try {
+        const attemptMessages = repairContent
+          ? [
+              ...messages,
+              { role: "assistant", content: repairContent },
+              {
+                role: "user",
+                content: "The previous JSON was invalid or incomplete. Return corrected strict JSON only, preserving supported facts and marking unknowns explicitly.",
+              },
+            ]
+          : messages;
+
         const response = await this.openai.chat.completions.create({
-          model: this.model,
-          messages,
-          temperature: 0.3,
+          model,
+          messages: attemptMessages,
+          temperature: this.temperature,
           max_tokens: maxTokens,
           response_format: { type: "json_object" },
         });
@@ -164,7 +230,12 @@ Competitor Insights: ${JSON.stringify(data?.competitors || [])}`,
         if (!content || typeof content !== "string") {
           throw new Error("Model returned empty content.");
         }
-        return JSON.parse(content);
+        try {
+          return JSON.parse(content);
+        } catch (parseError) {
+          repairContent = content;
+          throw parseError;
+        }
       } catch (error) {
         lastError = error;
       }
@@ -173,35 +244,25 @@ Competitor Insights: ${JSON.stringify(data?.competitors || [])}`,
     throw lastError || new Error("Model generation failed.");
   }
 
-  normalizeInfraCost(value) {
-    const fallback = this.getDefaultInfraCost();
+  normalizeInfraCost(value, evidence = { sourceCount: 0, hasEvidence: false, sourceFamilies: [] }) {
     const input = this.asObject(value);
-    const monthly = this.normalizeTriad(input.monthlyEstimate, { low: 200000, mid: 450000, high: 900000 });
-    const perUser = this.normalizeTriad(input.perUserEstimate, { low: 0.2, mid: 0.45, high: 0.9 });
-    const margin = this.normalizeTriad(input.grossMargin, { low: 70, mid: 82, high: 90 });
-    const breakdown = Array.isArray(input.breakdown)
-      ? input.breakdown.map((item) => ({
-          category: this.asString(item?.category, "Unknown category"),
-          estimate: this.asString(item?.estimate, "Unknown"),
-          confidence: this.normalizeConfidence(item?.confidence),
-          evidence: this.asString(item?.evidence, "Derived from limited public signals."),
-          pct: this.asNumber(item?.pct, 0),
-        }))
-      : fallback.breakdown;
-    const signals = Array.isArray(input.signals)
-      ? input.signals.map((item) => ({
-          icon: this.asString(item?.icon, "•"),
-          text: this.asString(item?.text, "Signal data unavailable"),
-        }))
-      : fallback.signals;
+    const insufficient = !evidence?.hasEvidence;
+    const monthly = this.normalizeTriad(input.monthlyEstimate, { low: 0, mid: 0, high: 0 });
+    const perUser = this.normalizeTriad(input.perUserEstimate, { low: 0, mid: 0, high: 0 });
+    const margin = this.normalizeTriad(input.grossMargin, { low: 0, mid: 0, high: 0 });
+    const breakdown = this.normalizeBreakdown(input.breakdown);
+    const signals = this.normalizeSignals(input.signals);
+    const citations = this.normalizeCitations(input.citations);
+    const limitations = this.normalizeLimitations(input.limitations, insufficient);
 
-    const evidenceSources = this.getEvidenceSources(input, ["techStack", "trafficSignals", "thirdParty", "headcount"]);
+    const evidenceSources = this.resolveEvidenceSources(evidence, input);
     const validationWarnings = this.validateInfraCost({
       monthlyEstimate: monthly,
       perUserEstimate: perUser,
       revenueEstimate: this.asNumber(input.revenueEstimate, 0),
       grossMargin: margin,
       breakdown,
+      insufficient,
     });
 
     return {
@@ -209,221 +270,223 @@ Competitor Insights: ${JSON.stringify(data?.competitors || [])}`,
       perUserEstimate: perUser,
       revenueEstimate: this.asNumber(input.revenueEstimate, 0),
       grossMargin: margin,
-      breakdown: breakdown.length > 0 ? breakdown : fallback.breakdown,
-      signals: signals.length > 0 ? signals : fallback.signals,
+      breakdown,
+      signals,
+      citations,
+      limitations,
       evidenceSources,
+      insufficientData: insufficient || breakdown.length === 0,
       confidence: this.buildConfidence({
-        sourceCount: evidenceSources.length,
-        warningCount: validationWarnings.length,
-        fallbackPenalty: breakdown.length === 0 || signals.length === 0 ? 10 : 0,
+        sourceCount: evidence.sourceCount,
+        warningCount: validationWarnings.length + limitations.length,
+        fallbackPenalty: breakdown.length === 0 ? this.quality.confidenceFallbackPenalty || 20 : 0,
+        citationCount: citations.length,
       }),
       validationWarnings,
     };
   }
 
-  normalizeBuildCost(value) {
-    const fallback = this.getDefaultBuildCost();
+  normalizeBuildCost(value, evidence = { sourceCount: 0, hasEvidence: false, sourceFamilies: [] }) {
     const input = this.asObject(value);
-    const totalEstimate = this.normalizeTriad(input.totalEstimate, { low: 1500000, mid: 3500000, high: 7000000 });
-    const timeEstimate = this.normalizeTriad(input.timeEstimate, { low: 8, mid: 14, high: 24 });
-    const teamSize = this.normalizeTeamSize(input.teamSize, fallback.teamSize);
+    const insufficient = !evidence?.hasEvidence;
+    const totalEstimate = this.normalizeTriad(input.totalEstimate, { low: 0, mid: 0, high: 0 });
+    const timeEstimate = this.normalizeTriad(input.timeEstimate, { low: 0, mid: 0, high: 0 });
+    const teamSize = this.normalizeTeamSize(input.teamSize, { min: 0, optimal: 0, max: 0 });
     const breakdown = Array.isArray(input.breakdown)
       ? input.breakdown.map((item) => ({
-          module: this.asString(item?.module, "Unknown module"),
+          module: this.asString(item?.module, "Unattributed module"),
           effort: this.asString(item?.effort, "Unknown"),
           cost: this.asString(item?.cost, "Unknown"),
           complexity: this.normalizeComplexity(item?.complexity),
-          notes: this.asString(item?.notes, "Evidence limited; estimate uses conservative assumptions."),
+          notes: this.asString(item?.notes, "Estimate derived from limited feature evidence."),
         }))
-      : fallback.breakdown;
+      : [];
     const techStack = Array.isArray(input.techStack)
       ? input.techStack.map((item) => ({
-          layer: this.asString(item?.layer, "Unknown layer"),
+          layer: this.asString(item?.layer, "Application"),
           tech: this.asString(item?.tech, "Unknown"),
           detected: Boolean(item?.detected),
           confidence: this.normalizeConfidence(item?.confidence),
         }))
-      : fallback.techStack;
+      : [];
+    const citations = this.normalizeCitations(input.citations);
+    const limitations = this.normalizeLimitations(input.limitations, insufficient);
+    const evidenceSources = this.resolveEvidenceSources(evidence, input);
+    const validationWarnings = this.validateBuildCost({ totalEstimate, timeEstimate, teamSize, breakdown, techStack, insufficient });
 
-    const evidenceSources = this.getEvidenceSources(input, ["features", "openSource", "hiringBenchmarks"]);
-    const validationWarnings = this.validateBuildCost({
+    return {
       totalEstimate,
       timeEstimate,
       teamSize,
       breakdown,
       techStack,
-    });
-
-    return {
-      totalEstimate,
-      timeEstimate,
-      teamSize,
-      breakdown: breakdown.length > 0 ? breakdown : fallback.breakdown,
-      techStack: techStack.length > 0 ? techStack : fallback.techStack,
+      citations,
+      limitations,
       evidenceSources,
+      insufficientData: insufficient || breakdown.length === 0,
       confidence: this.buildConfidence({
-        sourceCount: evidenceSources.length,
-        warningCount: validationWarnings.length,
-        fallbackPenalty: breakdown.length === 0 || techStack.length === 0 ? 10 : 0,
+        sourceCount: evidence.sourceCount,
+        warningCount: validationWarnings.length + limitations.length,
+        fallbackPenalty: breakdown.length === 0 ? this.quality.confidenceFallbackPenalty || 20 : 0,
+        citationCount: citations.length,
       }),
       validationWarnings,
     };
   }
 
-  normalizeBuyerCost(value) {
-    const fallback = this.getDefaultBuyerCost();
+  normalizeBuyerCost(value, evidence = { sourceCount: 0, hasEvidence: false, sourceFamilies: [] }) {
     const input = this.asObject(value);
+    const insufficient = !evidence?.hasEvidence;
     const plans = Array.isArray(input.plans)
       ? input.plans.map((plan) => ({
-          name: this.asString(plan?.name, "Unknown"),
+          name: this.asString(plan?.name, "Unknown plan"),
           listed: this.asString(plan?.listed, "Unknown"),
           actualMonthly: this.asString(plan?.actualMonthly, "Unknown"),
-          gotchas: Array.isArray(plan?.gotchas) ? plan.gotchas.map((x) => this.asString(x, "Unknown limitation")) : [],
+          gotchas: Array.isArray(plan?.gotchas) ? plan.gotchas.map((x) => this.asString(x, "Unverified limitation")) : [],
           hiddenCosts: Array.isArray(plan?.hiddenCosts)
             ? plan.hiddenCosts.map((hc) => ({
                 item: this.asString(hc?.item, "Unknown"),
                 cost: this.asString(hc?.cost, "Unknown"),
-                note: this.asString(hc?.note, "Estimate based on partial evidence."),
+                note: this.asString(hc?.note, "Requires verification."),
               }))
             : [],
         }))
-      : fallback.plans;
-
+      : [];
     const tcoComparison = Array.isArray(input.tcoComparison)
       ? input.tcoComparison.map((row) => ({
-          scenario: this.asString(row?.scenario, "Unknown scenario"),
+          scenario: this.asString(row?.scenario, "Typical team"),
           monthlyListed: this.asString(row?.monthlyListed, "Unknown"),
           monthlyActual: this.asString(row?.monthlyActual, "Unknown"),
           annualDelta: this.asString(row?.annualDelta, "Unknown"),
-          note: this.asString(row?.note, "Estimate based on limited information."),
+          note: this.asString(row?.note, "Estimate requires more pricing evidence."),
         }))
-      : fallback.tcoComparison;
-
+      : [];
     const competitorComparison = Array.isArray(input.competitorComparison)
       ? input.competitorComparison.map((row) => ({
           name: this.asString(row?.name, "Unknown competitor"),
           cost: this.asString(row?.cost, "Unknown"),
-          features: this.asString(row?.features, "N/A"),
+          features: this.asString(row?.features, "Unknown"),
         }))
-      : fallback.competitorComparison;
-
-    const evidenceSources = this.getEvidenceSources(input, ["pricing", "pricingFinePrint", "reviews", "limitsDocs", "competitors"]);
-    const validationWarnings = this.validateBuyerCost({ plans, tcoComparison, competitorComparison });
+      : [];
+    const citations = this.normalizeCitations(input.citations);
+    const limitations = this.normalizeLimitations(input.limitations, insufficient);
+    const evidenceSources = this.resolveEvidenceSources(evidence, input);
+    const validationWarnings = this.validateBuyerCost({ plans, tcoComparison, competitorComparison, insufficient });
 
     return {
-      plans: plans.length > 0 ? plans : fallback.plans,
-      tcoComparison: tcoComparison.length > 0 ? tcoComparison : fallback.tcoComparison,
-      competitorComparison: competitorComparison.length > 0 ? competitorComparison : fallback.competitorComparison,
+      plans,
+      tcoComparison,
+      competitorComparison,
+      citations,
+      limitations,
       evidenceSources,
+      insufficientData: insufficient || plans.length === 0,
       confidence: this.buildConfidence({
-        sourceCount: evidenceSources.length,
-        warningCount: validationWarnings.length,
-        fallbackPenalty: plans.length === 0 || tcoComparison.length === 0 ? 10 : 0,
+        sourceCount: evidence.sourceCount,
+        warningCount: validationWarnings.length + limitations.length,
+        fallbackPenalty: plans.length === 0 ? this.quality.confidenceFallbackPenalty || 20 : 0,
+        citationCount: citations.length,
       }),
       validationWarnings,
     };
   }
 
-  getDefaultInfraCost() {
+  getDefaultInfraCost(evidence = { sourceCount: 0 }) {
     return {
-      monthlyEstimate: { low: 200000, mid: 450000, high: 900000 },
-      perUserEstimate: { low: 0.2, mid: 0.45, high: 0.9 },
+      monthlyEstimate: { low: 0, mid: 0, high: 0 },
+      perUserEstimate: { low: 0, mid: 0, high: 0 },
       revenueEstimate: 0,
-      grossMargin: { low: 70, mid: 82, high: 90 },
-      breakdown: [
-        {
-          category: "Infrastructure baseline",
-          estimate: "Insufficient external evidence",
-          confidence: "low",
-          evidence: "Public data was limited during this run.",
-          pct: 100,
-        },
-      ],
-      signals: [{ icon: "•", text: "Limited signal quality. Treat estimates as directional." }],
-      evidenceSources: [],
-      confidence: { overall: 35, level: "low" },
-      validationWarnings: ["Using fallback infra defaults due to limited model output."],
+      grossMargin: { low: 0, mid: 0, high: 0 },
+      breakdown: [],
+      signals: [],
+      citations: [],
+      limitations: ["Infrastructure synthesis failed or scanner evidence was unavailable."],
+      evidenceSources: evidence.sourceFamilies || [],
+      insufficientData: true,
+      confidence: this.buildConfidence({ sourceCount: evidence.sourceCount || 0, warningCount: 2, fallbackPenalty: 20 }),
+      validationWarnings: ["Infrastructure model output unavailable."],
     };
   }
 
-  getDefaultBuildCost() {
+  getDefaultBuildCost(evidence = { sourceCount: 0 }) {
     return {
-      totalEstimate: { low: 1500000, mid: 3500000, high: 7000000 },
-      timeEstimate: { low: 8, mid: 14, high: 24 },
-      teamSize: { min: 6, optimal: 10, max: 18 },
-      breakdown: [
-        {
-          module: "Core platform",
-          effort: "Unknown",
-          cost: "Unknown",
-          complexity: "medium",
-          notes: "Insufficient feature evidence to generate module-level confidence.",
-        },
-      ],
-      techStack: [{ layer: "Application", tech: "Unknown", detected: false, confidence: "low" }],
-      evidenceSources: [],
-      confidence: { overall: 35, level: "low" },
-      validationWarnings: ["Using fallback build defaults due to limited model output."],
+      totalEstimate: { low: 0, mid: 0, high: 0 },
+      timeEstimate: { low: 0, mid: 0, high: 0 },
+      teamSize: { min: 0, optimal: 0, max: 0 },
+      breakdown: [],
+      techStack: [],
+      citations: [],
+      limitations: ["Build synthesis failed or feature evidence was unavailable."],
+      evidenceSources: evidence.sourceFamilies || [],
+      insufficientData: true,
+      confidence: this.buildConfidence({ sourceCount: evidence.sourceCount || 0, warningCount: 2, fallbackPenalty: 20 }),
+      validationWarnings: ["Build model output unavailable."],
     };
   }
 
-  getDefaultBuyerCost() {
+  getDefaultBuyerCost(evidence = { sourceCount: 0 }) {
     return {
-      plans: [
-        {
-          name: "Unknown",
-          listed: "Unknown",
-          actualMonthly: "Unknown",
-          gotchas: ["Pricing evidence was limited in this scan."],
-          hiddenCosts: [],
-        },
-      ],
-      tcoComparison: [
-        {
-          scenario: "Typical team",
-          monthlyListed: "Unknown",
-          monthlyActual: "Unknown",
-          annualDelta: "Unknown",
-          note: "Insufficient pricing data to quantify delta.",
-        },
-      ],
-      competitorComparison: [{ name: "Peer SaaS", cost: "Unknown", features: "Comparable feature set" }],
-      evidenceSources: [],
-      confidence: { overall: 35, level: "low" },
-      validationWarnings: ["Using fallback buyer-cost defaults due to limited model output."],
+      plans: [],
+      tcoComparison: [],
+      competitorComparison: [],
+      citations: [],
+      limitations: ["Buyer-cost synthesis failed or pricing evidence was unavailable."],
+      evidenceSources: evidence.sourceFamilies || [],
+      insufficientData: true,
+      confidence: this.buildConfidence({ sourceCount: evidence.sourceCount || 0, warningCount: 2, fallbackPenalty: 20 }),
+      validationWarnings: ["Buyer model output unavailable."],
     };
   }
 
-  getEvidenceSources(input, fallback) {
-    const sourceCandidates = Array.isArray(input?.evidenceSources) ? input.evidenceSources : input?._meta?.sourceFamilies;
-    if (Array.isArray(sourceCandidates) && sourceCandidates.length > 0) {
-      return [...new Set(sourceCandidates.map((x) => this.asString(x)).filter(Boolean))];
-    }
-    return fallback;
+  resolveEvidenceSources(evidence, modelOutput) {
+    const scannerFamilies = Array.isArray(evidence?.sourceFamilies) ? evidence.sourceFamilies : [];
+    const modelFamilies = Array.isArray(modelOutput?.evidenceSources) ? modelOutput.evidenceSources : [];
+    return [...new Set([...scannerFamilies, ...modelFamilies].filter(Boolean))];
   }
 
-  buildConfidence({ sourceCount = 0, warningCount = 0, fallbackPenalty = 0 }) {
-    let score = 45 + sourceCount * 10 - warningCount * 12 - fallbackPenalty;
-    score = Math.max(10, Math.min(95, Math.round(score)));
-    const level = score >= 80 ? "high" : score >= 60 ? "medium" : "low";
+  buildConfidence({ sourceCount = 0, warningCount = 0, fallbackPenalty = 0, citationCount = 0 }) {
+    const base = this.quality.confidenceBase ?? 35;
+    const perSource = this.quality.confidencePerSource ?? 12;
+    const warningPenalty = this.quality.confidenceWarningPenalty ?? 10;
+    let score = base + sourceCount * perSource + citationCount * 4 - warningCount * warningPenalty - fallbackPenalty;
+    score = Math.max(5, Math.min(95, Math.round(score)));
+    const high = this.quality.highConfidenceThreshold ?? 80;
+    const medium = this.quality.mediumConfidenceThreshold ?? 60;
+    const level = score >= high ? "high" : score >= medium ? "medium" : "low";
     return { overall: score, level };
   }
 
   validateInfraCost(value) {
     const warnings = [];
     const margin = value?.grossMargin || {};
-    if (margin.high > 99 || margin.low < 5) warnings.push("Gross margin looks outside realistic SaaS ranges.");
-    if ((value?.monthlyEstimate?.high || 0) > 200000000) warnings.push("Monthly infra high estimate exceeds expected bounds.");
-    if ((value?.perUserEstimate?.high || 0) > 1000) warnings.push("Per-user infra estimate appears unusually high.");
+    const bounds = this.bounds;
+    if (margin.high > (bounds.grossMarginMax ?? 99) || margin.low < (bounds.grossMarginMin ?? 5)) {
+      warnings.push("Gross margin looks outside realistic SaaS ranges.");
+    }
+    if ((value?.monthlyEstimate?.high || 0) > (bounds.monthlyInfraMax ?? 200000000)) {
+      warnings.push("Monthly infra high estimate exceeds configured bounds.");
+    }
+    if ((value?.perUserEstimate?.high || 0) > (bounds.perUserInfraMax ?? 1000)) {
+      warnings.push("Per-user infra estimate appears unusually high.");
+    }
     if ((value?.revenueEstimate || 0) < 0) warnings.push("Revenue estimate was negative and may be unreliable.");
+    if (value?.insufficient) warnings.push("Infrastructure estimate generated with insufficient scanner evidence.");
     return warnings;
   }
 
   validateBuildCost(value) {
     const warnings = [];
-    if ((value?.teamSize?.max || 0) > 500 || (value?.teamSize?.min || 0) < 1) warnings.push("Team size range appears unrealistic.");
-    if ((value?.timeEstimate?.high || 0) > 120) warnings.push("Timeline high estimate is unusually long.");
-    if ((value?.totalEstimate?.high || 0) > 1000000000) warnings.push("Build high estimate exceeds expected bounds.");
+    const bounds = this.bounds;
+    if ((value?.teamSize?.max || 0) > (bounds.teamSizeMax ?? 500) || (value?.teamSize?.min || 0) < 0) {
+      warnings.push("Team size range appears unrealistic.");
+    }
+    if ((value?.timeEstimate?.high || 0) > (bounds.buildMonthsMax ?? 120)) {
+      warnings.push("Timeline high estimate is unusually long.");
+    }
+    if ((value?.totalEstimate?.high || 0) > (bounds.buildTotalMax ?? 1000000000)) {
+      warnings.push("Build high estimate exceeds configured bounds.");
+    }
+    if (value?.insufficient) warnings.push("Build estimate generated with insufficient feature evidence.");
     return warnings;
   }
 
@@ -431,69 +494,102 @@ Competitor Insights: ${JSON.stringify(data?.competitors || [])}`,
     const warnings = [];
     if (!Array.isArray(value?.plans) || value.plans.length === 0) warnings.push("Plan-level pricing evidence is missing.");
     if (!Array.isArray(value?.tcoComparison) || value.tcoComparison.length === 0) warnings.push("TCO comparison evidence is limited.");
-    if (!Array.isArray(value?.competitorComparison) || value.competitorComparison.length === 0) warnings.push("Competitor benchmarks are missing.");
+    if (value?.insufficient) warnings.push("Buyer pricing analysis generated with insufficient scanner evidence.");
     return warnings;
   }
 
   detectAnomalies({ infraCost, buildCost, buyerCost, crossValidationWarnings = [] }) {
     const anomalies = [];
+    const bounds = this.bounds;
     const monthlyMid = this.asNumber(infraCost?.monthlyEstimate?.mid, 0);
     const revenue = this.asNumber(infraCost?.revenueEstimate, 0);
-    if (revenue > 0 && monthlyMid > revenue * 2) {
-      anomalies.push("Infra monthly midpoint is over 2x the inferred monthly revenue.");
+    if (revenue > 0 && monthlyMid > revenue * (bounds.revenueInfraRatioMax ?? 2)) {
+      anomalies.push("Infra monthly midpoint is high relative to inferred monthly revenue.");
     }
     const teamOptimal = this.asNumber(buildCost?.teamSize?.optimal, 0);
     const buildMonths = this.asNumber(buildCost?.timeEstimate?.mid, 0);
-    if (teamOptimal > 0 && buildMonths > 0 && teamOptimal * buildMonths > 1000) {
+    if (teamOptimal > 0 && buildMonths > 0 && teamOptimal * buildMonths > (bounds.staffingMonthsMax ?? 1000)) {
       anomalies.push("Build staffing-month load appears unusually high.");
     }
     const buyerPlans = Array.isArray(buyerCost?.plans) ? buyerCost.plans : [];
     if (buyerPlans.length > 0 && buyerPlans.every((x) => this.asString(x?.actualMonthly, "Unknown") === "Unknown")) {
       anomalies.push("Buyer actual monthly pricing remained unknown across detected plans.");
     }
+    if (infraCost?.insufficientData) anomalies.push("Infrastructure pillar marked insufficient data.");
+    if (buildCost?.insufficientData) anomalies.push("Build pillar marked insufficient data.");
+    if (buyerCost?.insufficientData) anomalies.push("Buyer pillar marked insufficient data.");
     return [...new Set([...anomalies, ...crossValidationWarnings])];
   }
 
-  crossValidateAgainstSignals({ infraCost, buildCost, buyerCost, infraData, buildData, buyerData }) {
+  crossValidateAgainstSignals({ infraCost, buildCost, buyerCost, infraData, buildData, buyerData, enrichment }) {
     const infraWarnings = [];
     const buildWarnings = [];
     const buyerWarnings = [];
     const anomalies = [];
 
-    const hasTrafficSignal = Boolean(infraData?.traffic && Object.keys(infraData.traffic).length > 0);
+    const hasTrafficSignal = Boolean(enrichment?.infra?.trafficSignalCount || (infraData?.traffic && Object.keys(infraData.traffic).length > 0));
     if (!hasTrafficSignal && this.asNumber(infraCost?.revenueEstimate, 0) > 0) {
       infraWarnings.push("Revenue estimate inferred without concrete traffic signals.");
       anomalies.push("Revenue estimate exists but traffic evidence was missing.");
     }
-    const hasInfraSignals = Boolean(infraData?.techStack && Object.keys(infraData.techStack).length > 0);
+    const hasInfraSignals = Boolean(enrichment?.infra?.techSignalCount || (infraData?.techStack && Object.keys(infraData.techStack).length > 0));
     if (!hasInfraSignals && this.asNumber(infraCost?.monthlyEstimate?.mid, 0) > 0) {
       infraWarnings.push("Infrastructure estimate inferred with sparse technical evidence.");
     }
 
-    const featureCount = Array.isArray(buildData?.features?.detected) ? buildData.features.detected.length : 0;
-    if (featureCount === 0 && this.asNumber(buildCost?.totalEstimate?.mid, 0) > 20000000) {
-      buildWarnings.push("High build estimate inferred without detected feature evidence.");
-      anomalies.push("Build estimate appears high relative to detected feature count.");
-    }
-    const hiringSignals = buildData?.hiring && typeof buildData.hiring === "object" ? Object.keys(buildData.hiring).length : 0;
-    if (hiringSignals === 0 && this.asNumber(buildCost?.teamSize?.optimal, 0) >= 20) {
-      buildWarnings.push("Large team recommendation inferred without hiring benchmark signals.");
+    const featureCount = enrichment?.build?.detectedFeatureCount ?? (Array.isArray(buildData?.features?.detected) ? buildData.features.detected.length : 0);
+    if (featureCount === 0 && this.asNumber(buildCost?.totalEstimate?.mid, 0) > 0) {
+      buildWarnings.push("Build estimate produced without detected feature evidence.");
+      anomalies.push("Build estimate exists but feature evidence was missing.");
     }
 
-    const pricingPlans = Array.isArray(buyerData?.pricing?.plans) ? buyerData.pricing.plans.length : 0;
+    const pricingPlans = enrichment?.buyer?.pricingPlanCount ?? (Array.isArray(buyerData?.pricing?.plans) ? buyerData.pricing.plans.length : 0);
     const extractedPlans = Array.isArray(buyerCost?.plans) ? buyerCost.plans.length : 0;
     if (pricingPlans === 0 && extractedPlans > 0) {
-      buyerWarnings.push("Buyer plans were inferred without direct pricing-page plan extraction.");
+      buyerWarnings.push("Buyer plans were inferred without direct pricing-page extraction.");
       anomalies.push("Buyer plan output exceeds source pricing evidence.");
-    }
-    const knownActualPlans = Array.isArray(buyerCost?.plans)
-      ? buyerCost.plans.filter((p) => this.asString(p?.actualMonthly, "Unknown") !== "Unknown").length
-      : 0;
-    if (knownActualPlans > 0 && pricingPlans === 0) {
-      buyerWarnings.push("Actual monthly plan values may be speculative due to missing source pricing plans.");
     }
 
     return { infraWarnings, buildWarnings, buyerWarnings, anomalies };
+  }
+
+  normalizeBreakdown(items) {
+    if (!Array.isArray(items)) return [];
+    return items.map((item) => ({
+      category: this.asString(item?.category, "Unattributed"),
+      estimate: this.asString(item?.estimate, "Unknown"),
+      confidence: this.normalizeConfidence(item?.confidence),
+      evidence: this.asString(item?.evidence, "No direct evidence cited."),
+      pct: this.asNumber(item?.pct, 0),
+    }));
+  }
+
+  normalizeSignals(items) {
+    if (!Array.isArray(items)) return [];
+    return items.map((item) => ({
+      icon: this.asString(item?.icon, "•"),
+      text: this.asString(item?.text, "Signal unavailable"),
+    }));
+  }
+
+  normalizeCitations(items) {
+    if (!Array.isArray(items)) return [];
+    return items
+      .map((item) => ({
+        source: this.asString(item?.source, ""),
+        url: typeof item?.url === "string" ? item.url : null,
+        snippet: this.asString(item?.snippet, ""),
+        confidence: this.normalizeConfidence(item?.confidence),
+      }))
+      .filter((item) => item.source && item.snippet);
+  }
+
+  normalizeLimitations(items, insufficient) {
+    const list = Array.isArray(items) ? items.map((x) => this.asString(x)).filter(Boolean) : [];
+    if (insufficient && !list.some((x) => /insufficient|limited|sparse/i.test(x))) {
+      list.push("Scanner evidence was limited for this pillar.");
+    }
+    return list;
   }
 
   normalizeTriad(value, fallback) {
@@ -535,32 +631,33 @@ Competitor Insights: ${JSON.stringify(data?.competitors || [])}`,
     return typeof value === "string" && value.trim().length > 0 ? value : fallback;
   }
 
-  // ── Feature 1: Executive Summary ────────────────────────────
   async generateExecutiveSummary(infraCost, buildCost, buyerCost, targetInfo) {
     try {
       const parsed = await this.requestJsonWithRetry({
+        model: this.summaryModel,
         messages: [
           {
             role: "system",
-            content: `You are an executive SaaS analyst. Given three cost pillars for a SaaS product, produce a concise executive summary.
-Return strict JSON only:
+            content: `You are an executive SaaS analyst. Produce a decision-ready summary grounded in the supplied cost pillars, citations, and limitations.
+Return strict JSON:
 {
-  "summary": "1-2 paragraph plain-English overview of the product's cost profile, margins, build complexity, and buyer value.",
-  "keyFindings": ["string (3-5 key findings from the analysis)"],
-  "recommendations": [{ "title": "string", "detail": "string", "priority": "high"|"medium"|"low" }],
-  "verdictLabel": "string (one of: Strong Value, Fair Market, Overpriced, Insufficient Data)"
+  "summary": string,
+  "keyFindings": [string],
+  "recommendations": [{ "title": string, "detail": string, "priority": "high"|"medium"|"low", "evidence": string }],
+  "verdictLabel": "Strong Value"|"Fair Market"|"Overpriced"|"Insufficient Data",
+  "dataGaps": [string]
 }
-Be factual. If data is sparse, set verdictLabel to "Insufficient Data" and note limitations in recommendations.`,
+If any pillar has insufficientData=true, verdictLabel must be "Insufficient Data".`,
           },
           {
             role: "user",
             content: `Executive summary for ${targetInfo.name} (${targetInfo.url}):
-Infrastructure Cost: ${JSON.stringify(infraCost || {})}
-Build Cost: ${JSON.stringify(buildCost || {})}
-Buyer Cost: ${JSON.stringify(buyerCost || {})}`,
+Infrastructure: ${JSON.stringify(infraCost || {})}
+Build: ${JSON.stringify(buildCost || {})}
+Buyer: ${JSON.stringify(buyerCost || {})}`,
           },
         ],
-        maxTokens: 1500,
+        maxTokens: this.maxTokens.executive || 1800,
       });
       return this.normalizeExecutiveSummary(parsed);
     } catch (error) {
@@ -575,45 +672,47 @@ Buyer Cost: ${JSON.stringify(buyerCost || {})}`,
     if (!summary) return null;
     return {
       summary,
-      keyFindings: Array.isArray(input.keyFindings)
-        ? input.keyFindings.map((x) => this.asString(x)).filter(Boolean)
-        : [],
+      keyFindings: Array.isArray(input.keyFindings) ? input.keyFindings.map((x) => this.asString(x)).filter(Boolean) : [],
       recommendations: Array.isArray(input.recommendations)
-        ? input.recommendations.map((r) => ({
-            title: this.asString(r?.title, "Recommendation"),
-            detail: this.asString(r?.detail, ""),
-            priority: ["high", "medium", "low"].includes(r?.priority) ? r.priority : "medium",
-          })).filter((r) => r.detail)
+        ? input.recommendations
+            .map((r) => ({
+              title: this.asString(r?.title, "Recommendation"),
+              detail: this.asString(r?.detail, ""),
+              priority: ["high", "medium", "low"].includes(r?.priority) ? r.priority : "medium",
+              evidence: this.asString(r?.evidence, ""),
+            }))
+            .filter((r) => r.detail)
         : [],
       verdictLabel: this.asString(input.verdictLabel, "Insufficient Data"),
+      dataGaps: Array.isArray(input.dataGaps) ? input.dataGaps.map((x) => this.asString(x)).filter(Boolean) : [],
     };
   }
 
-  // ── Feature 2: Negotiation Playbook ───────────────────────
   async generateNegotiationPlaybook(infraCost, buyerCost, targetInfo) {
     try {
       const parsed = await this.requestJsonWithRetry({
+        model: this.summaryModel,
         messages: [
           {
             role: "system",
-            content: `You are a SaaS procurement negotiation expert. Given a vendor's estimated infrastructure costs (their margins) and buyer pricing data, generate a negotiation playbook.
-Return strict JSON only:
+            content: `You are a SaaS procurement negotiation expert. Build a playbook from vendor margin signals and buyer pricing evidence.
+Return strict JSON:
 {
-  "leverageFactors": [{ "factor": "string", "explanation": "string" }],
-  "talkingPoints": ["string"],
-  "counterOffers": [{ "plan": "string", "currentPrice": "string", "suggestedTarget": "string", "rationale": "string" }],
-  "riskWarnings": ["string"]
+  "leverageFactors": [{ "factor": string, "explanation": string, "proof": string }],
+  "talkingPoints": [string],
+  "counterOffers": [{ "plan": string, "currentPrice": string, "suggestedTarget": string, "rationale": string, "proof": string }],
+  "riskWarnings": [string]
 }
-Base suggestions on data. If margin or pricing data is sparse, say so in riskWarnings and be conservative.`,
+Do not recommend aggressive discounts without supporting proof.`,
           },
           {
             role: "user",
             content: `Negotiation playbook for ${targetInfo.name} (${targetInfo.url}):
-Vendor Infra Costs & Margins: ${JSON.stringify(infraCost || {})}
-Buyer Pricing & Plans: ${JSON.stringify(buyerCost || {})}`,
+Vendor infra and margins: ${JSON.stringify(infraCost || {})}
+Buyer pricing: ${JSON.stringify(buyerCost || {})}`,
           },
         ],
-        maxTokens: 1500,
+        maxTokens: this.maxTokens.negotiation || 1800,
       });
       return this.normalizeNegotiationPlaybook(parsed);
     } catch (error) {
@@ -625,93 +724,106 @@ Buyer Pricing & Plans: ${JSON.stringify(buyerCost || {})}`,
   normalizeNegotiationPlaybook(value) {
     const input = this.asObject(value);
     const leverageFactors = Array.isArray(input.leverageFactors)
-      ? input.leverageFactors.map((f) => ({
-          factor: this.asString(f?.factor, ""),
-          explanation: this.asString(f?.explanation, ""),
-        })).filter((f) => f.factor && f.explanation)
+      ? input.leverageFactors
+          .map((f) => ({
+            factor: this.asString(f?.factor, ""),
+            explanation: this.asString(f?.explanation, ""),
+            proof: this.asString(f?.proof, ""),
+          }))
+          .filter((f) => f.factor && f.explanation)
       : [];
-    const talkingPoints = Array.isArray(input.talkingPoints)
-      ? input.talkingPoints.map((x) => this.asString(x)).filter(Boolean)
-      : [];
+    const talkingPoints = Array.isArray(input.talkingPoints) ? input.talkingPoints.map((x) => this.asString(x)).filter(Boolean) : [];
     if (leverageFactors.length === 0 && talkingPoints.length === 0) return null;
     return {
       leverageFactors,
       talkingPoints,
       counterOffers: Array.isArray(input.counterOffers)
-        ? input.counterOffers.map((c) => ({
-            plan: this.asString(c?.plan, "Unknown"),
-            currentPrice: this.asString(c?.currentPrice, "Unknown"),
-            suggestedTarget: this.asString(c?.suggestedTarget, "Unknown"),
-            rationale: this.asString(c?.rationale, ""),
-          })).filter((c) => c.rationale)
+        ? input.counterOffers
+            .map((c) => ({
+              plan: this.asString(c?.plan, "Unknown"),
+              currentPrice: this.asString(c?.currentPrice, "Unknown"),
+              suggestedTarget: this.asString(c?.suggestedTarget, "Unknown"),
+              rationale: this.asString(c?.rationale, ""),
+              proof: this.asString(c?.proof, ""),
+            }))
+            .filter((c) => c.rationale)
         : [],
-      riskWarnings: Array.isArray(input.riskWarnings)
-        ? input.riskWarnings.map((x) => this.asString(x)).filter(Boolean)
-        : [],
+      riskWarnings: Array.isArray(input.riskWarnings) ? input.riskWarnings.map((x) => this.asString(x)).filter(Boolean) : [],
     };
   }
 
-  // ── Feature 3: Risk Profile Analysis ──────────────────────
-  async analyzeRiskProfile(riskData, targetInfo) {
+  async analyzeRiskProfile(riskData, targetInfo, enrichment = null) {
     try {
+      const evidence = buildEvidenceContext(riskData, targetInfo.url);
       const parsed = await this.requestJsonWithRetry({
+        model: this.summaryModel,
         messages: [
           {
             role: "system",
-            content: `You are a cybersecurity and compliance analyst. Given security, privacy, and tracker signals from a SaaS product, generate a risk/compliance profile.
-Return strict JSON only:
+            content: `You are a cybersecurity and compliance analyst. Build a risk profile from scanner evidence only.
+Return strict JSON:
 {
   "overallRiskLevel": "low"|"medium"|"high"|"critical",
-  "securityScore": number (0-100),
-  "complianceBadges": [{ "name": "string", "status": "verified"|"claimed"|"missing" }],
-  "findings": [{ "category": "string", "severity": "info"|"warning"|"critical", "detail": "string" }],
+  "securityScore": number,
+  "complianceBadges": [{ "name": string, "status": "verified"|"claimed"|"missing", "evidence": string }],
+  "findings": [{ "category": string, "severity": "info"|"warning"|"critical", "detail": string, "evidence": string }],
   "trackerSummary": { "total": number, "categories": {} },
-  "recommendations": ["string"]
-}
-If signals are sparse, set overallRiskLevel to "medium" and note data gaps in findings.`,
+  "recommendations": [string],
+  "limitations": [string]
+}`,
           },
           {
             role: "user",
-            content: `Risk profile for ${targetInfo.name} (${targetInfo.url}):
-Security Headers: ${JSON.stringify(riskData?.securityHeaders || {})}
-Privacy & Compliance: ${JSON.stringify(riskData?.privacyCompliance || {})}
-Third-Party Trackers: ${JSON.stringify(riskData?.trackers || [])}`,
+            content: `Risk profile for ${targetInfo.name} (${targetInfo.url})
+Evidence: ${JSON.stringify(evidence)}
+Derived counts: ${JSON.stringify(enrichment?.risk || {})}
+Security headers: ${JSON.stringify(riskData?.securityHeaders || {})}
+Privacy and compliance: ${JSON.stringify(riskData?.privacyCompliance || {})}
+Trackers: ${JSON.stringify(riskData?.trackers || [])}`,
           },
         ],
-        maxTokens: 1500,
+        maxTokens: this.maxTokens.risk || 1800,
       });
-      return this.normalizeRiskProfile(parsed);
+      return this.normalizeRiskProfile(parsed, evidence);
     } catch (error) {
       console.error("[CostLens] Risk profile analysis failed:", error);
       return this.getDefaultRiskProfile();
     }
   }
 
-  normalizeRiskProfile(value) {
+  normalizeRiskProfile(value, evidence = { sourceCount: 0 }) {
     const input = this.asObject(value);
+    const insufficient = !evidence?.hasEvidence;
     return {
-      overallRiskLevel: ["low", "medium", "high", "critical"].includes(input.overallRiskLevel) ? input.overallRiskLevel : "medium",
-      securityScore: Math.max(0, Math.min(100, this.asNumber(input.securityScore, 50))),
+      overallRiskLevel: ["low", "medium", "high", "critical"].includes(input.overallRiskLevel) ? input.overallRiskLevel : insufficient ? "medium" : "medium",
+      securityScore: insufficient ? 0 : Math.max(0, Math.min(100, this.asNumber(input.securityScore, 0))),
       complianceBadges: Array.isArray(input.complianceBadges)
         ? input.complianceBadges.map((b) => ({
             name: this.asString(b?.name, "Unknown"),
             status: ["verified", "claimed", "missing"].includes(b?.status) ? b.status : "missing",
+            evidence: this.asString(b?.evidence, ""),
           }))
         : [],
       findings: Array.isArray(input.findings)
-        ? input.findings.map((f) => ({
-            category: this.asString(f?.category, "General"),
-            severity: ["info", "warning", "critical"].includes(f?.severity) ? f.severity : "info",
-            detail: this.asString(f?.detail, ""),
-          })).filter((f) => f.detail)
-        : [],
+        ? input.findings
+            .map((f) => ({
+              category: this.asString(f?.category, "General"),
+              severity: ["info", "warning", "critical"].includes(f?.severity) ? f.severity : "info",
+              detail: this.asString(f?.detail, ""),
+              evidence: this.asString(f?.evidence, ""),
+            }))
+            .filter((f) => f.detail)
+        : insufficient
+          ? [{ category: "Data quality", severity: "info", detail: "Risk scan evidence was limited.", evidence: "" }]
+          : [],
       trackerSummary: {
         total: this.asNumber(input.trackerSummary?.total, 0),
         categories: this.asObject(input.trackerSummary?.categories),
       },
-      recommendations: Array.isArray(input.recommendations)
-        ? input.recommendations.map((x) => this.asString(x)).filter(Boolean)
-        : [],
+      recommendations: Array.isArray(input.recommendations) ? input.recommendations.map((x) => this.asString(x)).filter(Boolean) : [],
+      limitations: this.normalizeLimitations(input.limitations, insufficient),
+      evidenceSources: evidence.sourceFamilies || [],
+      insufficientData: insufficient,
     };
   }
 
@@ -720,75 +832,83 @@ Third-Party Trackers: ${JSON.stringify(riskData?.trackers || [])}`,
       overallRiskLevel: "medium",
       securityScore: 0,
       complianceBadges: [],
-      findings: [{ category: "Data Quality", severity: "info", detail: "Risk scan data was insufficient for a full profile." }],
+      findings: [{ category: "Data quality", severity: "info", detail: "Risk scan data was insufficient for a full profile.", evidence: "" }],
       trackerSummary: { total: 0, categories: {} },
-      recommendations: ["Re-run with a full scan for more comprehensive risk analysis."],
+      recommendations: ["Re-run with a deeper scan for more comprehensive risk analysis."],
+      limitations: ["Risk model output unavailable."],
+      evidenceSources: [],
+      insufficientData: true,
     };
   }
 
-  // ── Feature: Competitor Landscape Analysis ─────────────────
   async generateCompetitorAnalysis(competitorsRaw, buyerCost, targetInfo) {
     try {
       const rawCompetitors = competitorsRaw?.competitors || [];
       if (rawCompetitors.length === 0) return null;
+      const evidence = buildEvidenceContext(competitorsRaw, targetInfo.url);
 
       const parsed = await this.requestJsonWithRetry({
+        model: this.summaryModel,
         messages: [
           {
             role: "system",
-            content: `You are a SaaS competitive intelligence analyst. Given a target product and its discovered competitors, produce a competitive landscape analysis.
-Return strict JSON only:
+            content: `You are a SaaS competitive intelligence analyst. Compare discovered competitors against the target using only supplied data.
+Return strict JSON:
 {
-  "landscape": "1-2 paragraph overview of the competitive landscape and market dynamics.",
-  "competitors": [{ "name": "string", "url": "string", "description": "string", "startingPrice": "string", "positioning": { "priceLevel": number (1-5, 1=cheapest), "featureRichness": number (1-5, 1=simplest) }, "prosVsTarget": ["string (1-3 advantages over the target)"], "consVsTarget": ["string (1-3 disadvantages vs the target)"] }],
-  "targetPositioning": { "priceLevel": number (1-5), "featureRichness": number (1-5) },
-  "verdict": "string — one sentence on where the target stands competitively"
-}
-Be factual and concise. Limit to the top 5 competitors.`,
+  "landscape": string,
+  "competitors": [{ "name": string, "url": string, "description": string, "startingPrice": string, "positioning": { "priceLevel": number, "featureRichness": number }, "prosVsTarget": [string], "consVsTarget": [string], "evidence": string }],
+  "targetPositioning": { "priceLevel": number, "featureRichness": number },
+  "verdict": string,
+  "limitations": [string]
+}`,
           },
           {
             role: "user",
             content: `Competitor analysis for ${targetInfo.name} (${targetInfo.url}):
-Discovered Competitors: ${JSON.stringify(rawCompetitors)}
-Target Buyer Pricing: ${JSON.stringify(buyerCost || {})}`,
+Discovered competitors: ${JSON.stringify(rawCompetitors)}
+Target buyer pricing: ${JSON.stringify(buyerCost || {})}`,
           },
         ],
-        maxTokens: 2000,
+        maxTokens: this.maxTokens.competitors || 2200,
       });
-      return this.normalizeCompetitorAnalysis(parsed);
+      return this.normalizeCompetitorAnalysis(parsed, evidence);
     } catch (error) {
       console.error("[CostLens] Competitor analysis generation failed:", error);
       return null;
     }
   }
 
-  normalizeCompetitorAnalysis(value) {
+  normalizeCompetitorAnalysis(value, evidence = { sourceCount: 0, sourceFamilies: [] }) {
     const input = this.asObject(value);
     const landscape = this.asString(input.landscape, "");
     const competitors = Array.isArray(input.competitors)
-      ? input.competitors.map((c) => ({
-          name: this.asString(c?.name, "Unknown"),
-          url: this.asString(c?.url, ""),
-          description: this.asString(c?.description, ""),
-          startingPrice: this.asString(c?.startingPrice, "Unknown"),
-          positioning: {
-            priceLevel: Math.max(1, Math.min(5, this.asNumber(c?.positioning?.priceLevel, 3))),
-            featureRichness: Math.max(1, Math.min(5, this.asNumber(c?.positioning?.featureRichness, 3))),
-          },
-          prosVsTarget: Array.isArray(c?.prosVsTarget) ? c.prosVsTarget.map((x) => this.asString(x)).filter(Boolean).slice(0, 3) : [],
-          consVsTarget: Array.isArray(c?.consVsTarget) ? c.consVsTarget.map((x) => this.asString(x)).filter(Boolean).slice(0, 3) : [],
-        })).filter((c) => c.name !== "Unknown")
+      ? input.competitors
+          .map((c) => ({
+            name: this.asString(c?.name, "Unknown"),
+            url: this.asString(c?.url, ""),
+            description: this.asString(c?.description, ""),
+            startingPrice: this.asString(c?.startingPrice, "Unknown"),
+            positioning: {
+              priceLevel: Math.max(1, Math.min(5, this.asNumber(c?.positioning?.priceLevel, 3))),
+              featureRichness: Math.max(1, Math.min(5, this.asNumber(c?.positioning?.featureRichness, 3))),
+            },
+            prosVsTarget: Array.isArray(c?.prosVsTarget) ? c.prosVsTarget.map((x) => this.asString(x)).filter(Boolean).slice(0, 3) : [],
+            consVsTarget: Array.isArray(c?.consVsTarget) ? c.consVsTarget.map((x) => this.asString(x)).filter(Boolean).slice(0, 3) : [],
+            evidence: this.asString(c?.evidence, ""),
+          }))
+          .filter((c) => c.name !== "Unknown")
       : [];
     if (competitors.length === 0) return null;
-    const targetPositioning = {
-      priceLevel: Math.max(1, Math.min(5, this.asNumber(input.targetPositioning?.priceLevel, 3))),
-      featureRichness: Math.max(1, Math.min(5, this.asNumber(input.targetPositioning?.featureRichness, 3))),
-    };
     return {
       landscape,
       competitors,
-      targetPositioning,
-      verdict: this.asString(input.verdict, "Competitive positioning data insufficient."),
+      targetPositioning: {
+        priceLevel: Math.max(1, Math.min(5, this.asNumber(input.targetPositioning?.priceLevel, 3))),
+        featureRichness: Math.max(1, Math.min(5, this.asNumber(input.targetPositioning?.featureRichness, 3))),
+      },
+      verdict: this.asString(input.verdict, "Competitive positioning requires more evidence."),
+      limitations: Array.isArray(input.limitations) ? input.limitations.map((x) => this.asString(x)).filter(Boolean) : [],
+      evidenceSources: evidence.sourceFamilies || [],
     };
   }
 

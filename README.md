@@ -162,13 +162,17 @@ graph TB
     Quality["Quality & Trust Engine\nConfidence · Provenance · Anomalies"]
   end
 
-  subgraph TinyFish["TinyFish Web Agent Engine"]
+  subgraph TinyFish["TinyFish Platform (@tiny-fish/sdk)"]
     direction LR
-    T1["Infra Run"]
-    T2["Build Run"]
-    T3["Buyer Run"]
-    T4["Risk Run"]
-    T5["Competitors Run"]
+    TE["TinyFishEngine"]
+    T1["Agent API\nstream · run · queue"]
+    T2["Search API\ncompetitor + review seeds"]
+    T3["Fetch API\npage markdown prefetch"]
+    T4["Batch API\nrun-batch · runs/batch"]
+    TE --> T1
+    TE --> T2
+    TE --> T3
+    TE --> T4
   end
 
   subgraph Sources["Crawled Platforms"]
@@ -205,11 +209,7 @@ sequenceDiagram
   Client->>Server: POST /api/investigate/async
 
   par 5 parallel async runs
-    Server->>TF: runAsync(infra)
-    Server->>TF: runAsync(build)
-    Server->>TF: runAsync(buyer)
-    Server->>TF: runAsync(risk)
-    Server->>TF: runAsync(competitors)
+    Server->>TF: queue() or run-batch (per-pillar output_schema)
   end
 
   Server-->>Client: { runIds }
@@ -262,17 +262,16 @@ Enter a SaaS URL and click **Investigate** to run a live TinyFish-backed scan.
 
 ### Environment Variables
 
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `TINYFISH_API_KEY` | Yes | — | TinyFish Web Agent API key |
-| `OPENAI_API_KEY` | Yes | — | OpenAI API key (GPT-4o) |
-| `PORT` | No | `3000` | Server port (auto-increments if busy) |
-| `CORS_ORIGIN` | No | `localhost` | Allowed CORS origins (comma-separated) |
-| `OPENAI_MODEL` | No | `gpt-4o` | OpenAI model to use |
-| `TINYFISH_ENDPOINT` | No | `https://agent.tinyfish.ai` | TinyFish API base URL |
-| `TINYFISH_BROWSER_PROFILE` | No | `stealth` | `lite` or `stealth` |
-| `INVESTIGATION_FAST_MODE` | No | `true` | Use async polling (recommended) |
-| `INVESTIGATION_TIMEOUT_MS` | No | `60000` | Max scan duration |
+Only two variables are required in `.env`:
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `TINYFISH_API_KEY` | Yes | TinyFish Web Agent API key |
+| `OPENAI_API_KEY` | Yes | OpenAI API key |
+
+All other settings (models, timeouts, quality scoring, TinyFish browser profile, async strategy, etc.) live in `server/config/index.js` with sensible defaults. Change them there if you need to tune behavior.
+
+Hosting platforms may still inject runtime variables such as `PORT`, `NODE_ENV`, and `VERCEL_URL` — you do not need to set those locally.
 
 ### Vercel Deployment
 
@@ -285,19 +284,39 @@ Enter a SaaS URL and click **Investigate** to run a live TinyFish-backed scan.
 
 ### TinyFish API Alignment
 
-Official docs: **[https://docs.mino.ai](https://docs.mino.ai)**
+Official docs: **[https://docs.tinyfish.ai](https://docs.tinyfish.ai)**
+
+CostLens uses the official **`@tiny-fish/sdk`** package via a thin **`TinyFishEngine`** orchestrator (`server/tinyfish/engine.js`) that combines Agent, Search, Fetch, and batch APIs. Pillar goals and `output_schema` definitions live in `server/tinyfish/pillars.js`.
+
+| SDK surface | Usage in CostLens |
+|------------|-------------------|
+| `client.agent.stream()` | Sync pillar scans with SSE progress (`STREAMING_URL`, `PROGRESS`) |
+| `client.agent.run()` | Structured JSON extraction (`output_schema` per pillar) |
+| `client.agent.queue()` | Default async strategy — one queued run per pillar with its own schema |
+| `client.search.query()` | Competitor discovery + buyer review complaint seeds |
+| `client.fetch.getContents()` | Markdown prefetch injected into agent goals (pricing, product, risk) |
+| `POST /v1/automation/run-batch` | Optional batch async start (`config.tinyfish.asyncStrategy`) |
+| `POST /v1/runs/batch` | Poll all pillar runs in one request |
+
+**Async strategy** (`config.tinyfish.asyncStrategy` in `server/config/index.js`):
+
+- `queue` (default) — five `agent.queue()` calls, each with pillar-specific `output_schema`
+- `batch` — single `run-batch` call for atomic multi-pillar start
+
+Underlying REST endpoints (handled by the SDK):
 
 | Endpoint | Usage |
 |----------|-------|
-| `POST /v1/automation/run` | Synchronous single-pillar scan |
-| `POST /v1/automation/run-async` | Start async run (returns `run_id`) |
-| `GET /v1/runs/{run_id}` | Poll run status and retrieve results |
-| `POST /v1/automation/run-sse` | SSE streaming (sync path) |
+| `POST /v1/automation/run-sse` | Streaming pillar scans (progress callbacks) |
+| `POST /v1/automation/run` | Synchronous pillar scans |
+| `POST /v1/automation/run-batch` | Atomic multi-pillar async start |
+| `POST /v1/runs/batch` | Batch poll for async runs |
+| `GET /v1/runs/{run_id}` | Single run lookup |
 
 - Base URL: `https://agent.tinyfish.ai`
-- Auth header: `X-API-Key: $TINYFISH_API_KEY`
+- Auth: `TINYFISH_API_KEY` env var (read automatically by the SDK)
 - Browser profiles: `lite` or `stealth`
-- [Error codes reference](https://docs.mino.ai/error-codes)
+- [Agent API reference](https://docs.tinyfish.ai/agent-api/reference)
 
 ---
 
@@ -339,12 +358,17 @@ costlens/
 │   ├── server.js                          # Express API + async polling + quality engine
 │   ├── config/index.js                    # Environment config loader
 │   ├── tinyfish/
-│   │   └── tinyfish-web-agent-client.js   # TinyFish Web Agent REST client
+│   │   ├── engine.js                      # TinyFishEngine — Agent + Search + Fetch + batch
+│   │   ├── pillars.js                     # Pillar goals + output_schema (single source of truth)
+│   │   ├── tinyfish-web-agent-client.js   # @tiny-fish/sdk adapter
+│   │   ├── goals.js                       # Async helpers (re-exports pillars)
+│   │   └── schemas.js                     # output_schema definitions
 │   ├── services/
-│   │   ├── infra-cost-scanner.js          # Pillar 1 scanner
-│   │   ├── build-cost-estimator.js        # Pillar 2 scanner
-│   │   ├── buyer-cost-analyzer.js         # Pillar 3 scanner
-│   │   └── tech-risk-scanner.js           # Pillar 4 scanner
+│   │   ├── infra-cost-scanner.js          # Pillar 1 — Fetch prefetch + Agent
+│   │   ├── build-cost-estimator.js        # Pillar 2 — Fetch prefetch + Agent
+│   │   ├── buyer-cost-analyzer.js         # Pillar 3 — Fetch + Search + Agent
+│   │   ├── tech-risk-scanner.js           # Pillar 4 — Fetch + Agent
+│   │   └── competitor-scanner.js          # Pillar 5 — Search seeds + Agent
 │   └── analysis/
 │       └── cost-modeler.js                # AI synthesis (5 generation methods)
 ├── .env.example

@@ -1,64 +1,68 @@
-// ============================================================
-// BUYER COST ANALYZER
-// Pillar 3: What it ACTUALLY costs the buyer
-// Uses TinyFish run automation + structured extraction goals
-// ============================================================
+import { getInvestigationPillars } from "../tinyfish/pillars.js";
 
 export class BuyerCostAnalyzer {
-  constructor(tinyfishClient) {
-    this.tinyfish = tinyfishClient;
+  constructor(engine) {
+    this.engine = engine;
   }
 
   async scan(targetUrl, options = {}) {
     const fast = options.fast === true;
     const extractedAt = new Date().toISOString();
+    const pillars = getInvestigationPillars(targetUrl, new URL(targetUrl.startsWith("http") ? targetUrl : `https://${targetUrl}`).hostname);
+
     const tasks = fast
-      ? [this.extractPricing(targetUrl)]
+      ? [this.runBuyerPillar(pillars.buyer, targetUrl, options.onEvent)]
       : [
-          this.extractPricing(targetUrl),
+          this.runBuyerPillar(pillars.buyer, targetUrl, options.onEvent),
           this.mineReviewsForCostComplaints(targetUrl),
           this.scanHelpDocsForLimits(targetUrl),
           this.extractCompetitorSignals(targetUrl),
         ];
     const results = await Promise.allSettled(tasks);
+
     const result = {
-      pricing: results[0]?.status === "fulfilled" ? results[0].value : null,
+      pricing: results[0]?.status === "fulfilled" ? results[0].value?.pricing ?? results[0].value : null,
       reviewInsights: !fast && results[1]?.status === "fulfilled" ? results[1].value : [],
       limits: !fast && results[2]?.status === "fulfilled" ? results[2].value : [],
       competitors: !fast && results[3]?.status === "fulfilled" ? results[3].value : [],
+      fetchPrefetch: Boolean(results[0]?.status === "fulfilled" && results[0].value?.fetchPrefetch),
+      searchPrefetch: !fast && Boolean(results[1]?.status === "fulfilled"),
     };
-    return {
-      ...result,
-      _meta: this.buildMeta({ pillar: "buyer", extractedAt, result }),
-    };
+    return { ...result, _meta: this.buildMeta({ pillar: "buyer", extractedAt, result }) };
   }
 
-  async extractPricing(url) {
-    const goal = [
-      "Find and extract pricing page details including plan cards and fine print.",
-      "Return strict JSON only:",
-      "{",
-      '  "plans": [{ "name": "string", "price": "string", "features": ["string"], "limits": ["string"] }],',
-      '  "finePrint": ["string"]',
-      "}",
-    ].join("\n");
-
-    const response = await this.tinyfish.runJson({ url, goal });
-    return this._coerceObject(response.result, { plans: [], finePrint: [] });
+  async runBuyerPillar(definition, targetUrl, onEvent) {
+    let extraGoal = "";
+    try {
+      const fetched = await this.engine.fetchMarkdown(targetUrl);
+      extraGoal = this.engine.formatFetchContext(fetched);
+    } catch (error) {
+      console.warn("[CostLens] Buyer fetch prefetch failed:", error?.message);
+    }
+    const response = await this.engine.runPillar(definition, { onEvent, extraGoal });
+    const pricing = this._coerceObject(response.result, { plans: [], finePrint: [] });
+    return { pricing, fetchPrefetch: Boolean(extraGoal) };
   }
 
   async mineReviewsForCostComplaints(url) {
     const name = new URL(url.startsWith("http") ? url : `https://${url}`).hostname.split(".")[0];
+    let extraGoal = "";
+    try {
+      const search = await this.engine.search(`${name} SaaS pricing complaints overages G2 reddit`, {
+        recency_minutes: 60 * 24 * 90,
+      });
+      extraGoal = this.engine.formatSearchContext(search?.results);
+    } catch (error) {
+      console.warn("[CostLens] Review search prefetch failed:", error?.message);
+    }
     const goal = [
       `Extract public complaints and reviews about ${name} pricing, hidden costs, and overages.`,
-      "Return strict JSON only:",
-      "{",
-      '  "g2": [{ "text": "string" }],',
-      '  "reddit": [{ "title": "string" }]',
-      "}",
+      'Return strict JSON: { "g2": [{ "text": string }], "reddit": [{ "title": string }] }',
     ].join("\n");
-
-    const response = await this.tinyfish.runJson({ url, goal });
+    const response = await this.engine.client.runJson({
+      url,
+      goal: extraGoal ? `${goal}\n\nSearch context:\n${extraGoal}` : goal,
+    });
     return this._coerceObject(response.result, { g2: [], reddit: [] });
   }
 
@@ -66,11 +70,10 @@ export class BuyerCostAnalyzer {
     const domain = new URL(url.startsWith("http") ? url : `https://${url}`).hostname;
     const goal = [
       `Find help/doc limits for ${domain}: rate limits, storage, file size, quota, fair use, overages.`,
-      "Return strict JSON only as an array:",
+      "Return strict JSON array:",
       '[{ "source": "string", "terms": ["string"] }]',
     ].join("\n");
-
-    const response = await this.tinyfish.runJson({ url: `https://${domain}`, goal });
+    const response = await this.engine.client.runJson({ url: `https://${domain}`, goal });
     const result = response.result;
     return Array.isArray(result) ? result : [];
   }
@@ -79,11 +82,10 @@ export class BuyerCostAnalyzer {
     const domain = new URL(url.startsWith("http") ? url : `https://${url}`).hostname;
     const goal = [
       `Identify likely competitors and pricing signal snippets for ${domain}.`,
-      "Return strict JSON only as an array:",
+      "Return strict JSON array:",
       '[{ "name": "string", "cost": "string", "features": "string" }]',
     ].join("\n");
-
-    const response = await this.tinyfish.runJson({ url: `https://${domain}`, goal });
+    const response = await this.engine.client.runJson({ url: `https://${domain}`, goal });
     const result = response.result;
     return Array.isArray(result) ? result : [];
   }
@@ -97,6 +99,8 @@ export class BuyerCostAnalyzer {
     const sourceFamilies = [];
     if (result?.pricing?.plans?.length) sourceFamilies.push("pricing");
     if (result?.pricing?.finePrint?.length) sourceFamilies.push("pricingFinePrint");
+    if (result?.fetchPrefetch) sourceFamilies.push("fetchApi");
+    if (result?.searchPrefetch) sourceFamilies.push("searchApi");
     if (
       (Array.isArray(result?.reviewInsights?.g2) && result.reviewInsights.g2.length > 0) ||
       (Array.isArray(result?.reviewInsights?.reddit) && result.reviewInsights.reddit.length > 0)
@@ -105,11 +109,6 @@ export class BuyerCostAnalyzer {
     }
     if (Array.isArray(result?.limits) && result.limits.length > 0) sourceFamilies.push("limitsDocs");
     if (Array.isArray(result?.competitors) && result.competitors.length > 0) sourceFamilies.push("competitors");
-    return {
-      pillar,
-      extractedAt,
-      sourceFamilies,
-      sourceCount: sourceFamilies.length,
-    };
+    return { pillar, extractedAt, sourceFamilies, sourceCount: sourceFamilies.length };
   }
 }

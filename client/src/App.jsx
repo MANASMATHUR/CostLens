@@ -14,8 +14,18 @@ import { ExportBar } from "./components/ExportBar";
 import { saveReport, loadReport } from "./utils/history";
 import { colors, space } from "./styles/tokens";
 
+const PILLAR_PROGRESS = {
+  infra: { label: "TinyFish Agent · Infrastructure", platforms: ["Target site", "TinyFish Fetch API", "TinyFish Agent · Infra"] },
+  build: { label: "TinyFish Agent · Build surface", platforms: ["Target site", "TinyFish Fetch API", "TinyFish Agent · Build"] },
+  buyer: { label: "TinyFish Agent · Buyer pricing", platforms: ["Target site", "TinyFish Fetch API", "TinyFish Search API", "TinyFish Agent · Buyer"] },
+  risk: { label: "TinyFish Agent · Risk audit", platforms: ["Target site", "TinyFish Fetch API", "TinyFish Agent · Risk"] },
+  competitors: { label: "TinyFish Agent · Competitors", platforms: ["TinyFish Search API", "TinyFish Agent · Competitors"] },
+};
+
+const PILLAR_ORDER = ["infra", "build", "buyer", "risk", "competitors"];
+
 export default function App() {
-  const [view, setView] = useState(null); // null = landing, "infra" | "build" | "buyer" | "risk"
+  const [view, setView] = useState(null);
   const [results, setResults] = useState(null);
   const [scanning, setScanning] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -33,23 +43,8 @@ export default function App() {
     }
   }, [results, scanError]);
 
-  const actions = [
-    "Fingerprinting tech stack via HTTP headers...",
-    "Extracting client-side JavaScript bundles...",
-    "Detecting cloud provider from CDN signatures...",
-    "Mapping API endpoints and database patterns...",
-    "Crawling Cloudflare Radar for traffic estimates...",
-    "Scanning LinkedIn for engineering headcount...",
-    "Extracting salary data from Glassdoor...",
-    "Analyzing pricing page for additional costs...",
-    "Cross-referencing G2 reviews for overage complaints...",
-    "Checking Crunchbase for revenue estimates...",
-    "Estimating infrastructure costs via AWS Calculator...",
-    "AI synthesizing cost model...",
-  ];
-
   const POLL_INTERVAL_MS = 3500;
-  const POLL_TIMEOUT_MS = 5 * 60 * 1000; // 5 min max polling (TinyFish runs async on their side)
+  const POLL_TIMEOUT_MS = 5 * 60 * 1000;
   const REQUEST_TIMEOUT_MS = 20000;
 
   const fetchJsonWithTimeout = useCallback(async (url, options = {}, timeoutMs = REQUEST_TIMEOUT_MS) => {
@@ -89,8 +84,8 @@ export default function App() {
     setView(null);
     setScanning(true);
     setProgress(5);
-    setAction("Starting investigation (async)...");
-    setScanPlatforms(["Target Site", "GitHub", "LinkedIn", "Glassdoor", "Levels.fyi", "AWS Calculator", "Cloudflare Radar", "SimilarWeb", "G2", "Reddit"]);
+    setAction("Queuing TinyFish agent runs (5 pillars)...");
+    setScanPlatforms(["Target site", "TinyFish Web Agent"]);
 
     try {
       const startData = await fetchJsonWithTimeout("/api/investigate/async", {
@@ -98,17 +93,22 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url: target }),
       });
-      const { runIds, domain, name } = startData;
+      const { runIds, domain, name, strategy } = startData;
       if (!runIds?.infra && !runIds?.build && !runIds?.buyer) {
         throw new Error("No run IDs returned. Check API keys and try again.");
       }
 
-      setProgress(15);
-      setAction("Running scans in background...");
+      setProgress(12);
+      setAction(
+        strategy === "batch"
+          ? "TinyFish batch run started — polling structured outputs..."
+          : "TinyFish queued 5 pillar runs — polling for completion..."
+      );
 
       const pollStart = Date.now();
-      let lastProgress = 15;
       let pollFailures = 0;
+      const activePlatforms = new Set(["Target site", "TinyFish Web Agent"]);
+
       while (Date.now() - pollStart < POLL_TIMEOUT_MS) {
         await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
         let data;
@@ -130,6 +130,10 @@ export default function App() {
         if (data.status === "complete") {
           setProgress(100);
           setAction("Investigation complete");
+          const reportPlatforms = data.report?.platformsScanned;
+          if (Array.isArray(reportPlatforms) && reportPlatforms.length > 0) {
+            setScanPlatforms(reportPlatforms);
+          }
           setResults(data.report);
           saveReport(data.report);
           setView("infra");
@@ -137,10 +141,21 @@ export default function App() {
           return;
         }
         const runs = data.runs || {};
-        const done = [runs.infra, runs.build, runs.buyer, runs.risk, runs.competitors].filter((s) => s === "COMPLETED" || s === "FAILED").length;
-        lastProgress = 20 + Math.round((done / 5) * 60);
-        setProgress(lastProgress);
-        setAction(`Waiting for scans... (${done}/5 done)`);
+        const donePillars = PILLAR_ORDER.filter((p) => runs[p] === "COMPLETED" || runs[p] === "FAILED");
+        for (const pillar of donePillars) {
+          for (const platform of PILLAR_PROGRESS[pillar]?.platforms || []) {
+            activePlatforms.add(platform);
+          }
+        }
+        const runningPillar = PILLAR_ORDER.find((p) => runs[p] === "RUNNING" || runs[p] === "PENDING");
+        const done = donePillars.length;
+        setProgress(15 + Math.round((done / PILLAR_ORDER.length) * 70));
+        setAction(
+          runningPillar
+            ? `${PILLAR_PROGRESS[runningPillar]?.label || runningPillar} — ${done}/${PILLAR_ORDER.length} pillars done`
+            : `Waiting for TinyFish runs... (${done}/${PILLAR_ORDER.length} done)`
+        );
+        setScanPlatforms([...activePlatforms]);
       }
       throw new Error("Investigation took too long. Try again or use a simpler URL.");
     } catch (err) {

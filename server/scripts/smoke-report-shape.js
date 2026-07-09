@@ -18,7 +18,8 @@ async function main() {
   assert(Array.isArray(buyer.plans), "Buyer plans should always be an array");
   assert(typeof infra.monthlyEstimate.low === "number", "Infra monthly low should be numeric");
   assert(typeof build.teamSize.min === "number", "Build team min should be numeric");
-  assert(typeof buyer.plans[0].name === "string", "Buyer plan name should be string");
+  assert(buyer.plans.length === 0 || typeof buyer.plans[0].name === "string", "Buyer plan name should be string when plans exist");
+  assert(buyer.insufficientData === true, "Buyer should mark insufficient data when plans are empty");
   assert(Array.isArray(infra.evidenceSources), "Infra should include evidenceSources");
   assert(Array.isArray(build.validationWarnings), "Build should include validationWarnings");
   assert(typeof buyer.confidence?.overall === "number", "Buyer should include confidence score");

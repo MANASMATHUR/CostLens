@@ -1,29 +1,29 @@
-// ============================================================
-// COSTLENS BACKEND — Analyze Any SaaS Down to Its True Cost
-// Three pillars: Infra cost, Build cost, Buyer cost
-// ============================================================
-
 import express from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
-import { TinyFishWebAgentClient } from "./tinyfish/tinyfish-web-agent-client.js";
+import { TinyFishEngine } from "./tinyfish/engine.js";
+import {
+  ASYNC_PILLAR_ORDER,
+} from "./tinyfish/goals.js";
 import { InfraCostScanner } from "./services/infra-cost-scanner.js";
 import { BuildCostEstimator } from "./services/build-cost-estimator.js";
 import { BuyerCostAnalyzer } from "./services/buyer-cost-analyzer.js";
 import { TechRiskScanner } from "./services/tech-risk-scanner.js";
+import { CompetitorScanner } from "./services/competitor-scanner.js";
 import { CostModeler } from "./analysis/cost-modeler.js";
-import { config, getMissingRuntimeEnv } from "./config/index.js";
+import { enrichScannerPayload } from "./analysis/enrichment.js";
+import { buildInvestigationReport } from "./analysis/report-builder.js";
+import { config, getExpectedSources, getExpectedTasks, getMissingRuntimeEnv } from "./config/index.js";
+import { companyNameFromDomain } from "./utils/domain.js";
+import { normalizePillarMeta } from "./utils/pillar-meta.js";
 
-const STREAM_TIMEOUT_MS = 120000; // 2 min — keep under Vercel/server limits
-const HEARTBEAT_INTERVAL_MS = 25000; // send progress every 25s
+const STREAM_TIMEOUT_MS = config.streamTimeoutMs;
+const HEARTBEAT_INTERVAL_MS = config.heartbeatIntervalMs;
 const MAX_URL_LENGTH = 2048;
 
 const app = express();
 const isProduction = process.env.NODE_ENV === "production";
-const configuredOrigins = (process.env.CORS_ORIGIN || "")
-  .split(",")
-  .map((origin) => origin.trim())
-  .filter(Boolean);
+const configuredOrigins = config.corsOrigins;
 function getAllowedProdOrigins() {
   const vercelUrl = process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "";
   return new Set([...configuredOrigins, vercelUrl].filter(Boolean));
@@ -51,13 +51,11 @@ const corsOrigin = (origin, callback) => {
   }
 
   if (!isProduction) {
-    // In dev, allow any localhost origin so fallback ports (3001, 3002...) work.
     callback(null, /^https?:\/\/localhost(:\d+)?$/.test(origin));
     return;
   }
 
   // In production, allow configured origins and the current Vercel deployment URL.
-  // On Vercel, auto-allow any *.vercel.app origin (deployment URLs, aliases, previews).
   const isVercelDeployment = Boolean(process.env.VERCEL);
   if (isVercelDeployment && /^https:\/\/[a-z0-9-]+\.vercel\.app$/i.test(origin)) {
     callback(null, true);
@@ -86,6 +84,10 @@ app.get("/api/health", (_, res) => {
     status: "ok",
     engine: "tinyfish",
     version: "1.0.0",
+    tinyfish: {
+      asyncStrategy: config.tinyfish.asyncStrategy,
+      features: ["agent", "search", "fetch", "batch", "structured-output", "sse"],
+    },
     envReady: missingEnv.length === 0,
     missingEnv,
   });
@@ -163,44 +165,16 @@ function assertValidAsyncPollPayload(body) {
   }
 }
 
-function normalizePillarMeta(value, fallbackPillar) {
-  const meta = value && typeof value === "object" ? value._meta : null;
-  return {
-    pillar: meta?.pillar || fallbackPillar,
-    extractedAt: meta?.extractedAt || new Date().toISOString(),
-    sourceFamilies: Array.isArray(meta?.sourceFamilies) ? [...new Set(meta.sourceFamilies)] : [],
-    sourceCount: Number.isFinite(Number(meta?.sourceCount))
-      ? Number(meta.sourceCount)
-      : Array.isArray(meta?.sourceFamilies)
-        ? meta.sourceFamilies.length
-        : 0,
-  };
-}
-
 function freshnessBucket(extractedAt) {
   const ts = Date.parse(extractedAt || "");
   if (!Number.isFinite(ts)) return "unknown";
   const ageHours = Math.max(0, (Date.now() - ts) / (1000 * 60 * 60));
-  if (ageHours <= 6) return "fresh";
-  if (ageHours <= 24) return "stale";
+  if (ageHours <= config.quality.freshnessFreshHours) return "fresh";
+  if (ageHours <= config.quality.freshnessStaleHours) return "stale";
   return "old";
 }
 
 function buildQualityMeta({ scannerErrors, modelErrors, modelWarnings, anomalies, pillarMeta, timedOut, fastMode }) {
-  const expectedSources = {
-    infra: fastMode ? 2 : 4,
-    build: fastMode ? 1 : 3,
-    buyer: fastMode ? 1 : 5,
-    risk: fastMode ? 1 : 3,
-    competitors: fastMode ? 1 : 1,
-  };
-  const expectedTasks = {
-    infra: fastMode ? 1 : 4,
-    build: fastMode ? 1 : 3,
-    buyer: fastMode ? 1 : 4,
-    risk: fastMode ? 1 : 3,
-    competitors: fastMode ? 1 : 1,
-  };
   const perPillar = {};
   const sourceCoverage = {};
   const dataFreshness = {};
@@ -210,53 +184,114 @@ function buildQualityMeta({ scannerErrors, modelErrors, modelWarnings, anomalies
   for (const pillar of pillars) {
     const meta = pillarMeta[pillar] || normalizePillarMeta(null, pillar);
     const uniqueFamilies = Array.isArray(meta.sourceFamilies) ? [...new Set(meta.sourceFamilies.filter(Boolean))] : [];
-    const safeSourceCount = Math.max(0, Math.min(expectedSources[pillar], Math.min(meta.sourceCount, uniqueFamilies.length || meta.sourceCount)));
+    const expectedSources = getExpectedSources(pillar, fastMode);
+    const expectedTasks = getExpectedTasks(pillar, fastMode);
+    const safeSourceCount = Math.max(0, Math.min(expectedSources, Math.min(meta.sourceCount, uniqueFamilies.length || meta.sourceCount)));
     const scannerFailed = Boolean(scannerErrors?.[pillar]);
     const modelFailed = Boolean(modelErrors?.[pillar]);
     const warningCount = Array.isArray(modelWarnings?.[pillar]) ? modelWarnings[pillar].length : 0;
-    const coverageScore = Math.round((safeSourceCount / expectedSources[pillar]) * 100);
+    const coverageScore = Math.round((safeSourceCount / expectedSources) * 100);
     const reliabilityScore = Math.max(
       0,
-      100 - (scannerFailed ? 45 : 0) - (modelFailed ? 35 : 0) - warningCount * 8 - (timedOut ? 10 : 0)
+      100 -
+        (scannerFailed ? config.quality.scannerFailPenalty : 0) -
+        (modelFailed ? config.quality.modelFailPenalty : 0) -
+        warningCount * config.quality.warningPenalty -
+        (timedOut ? config.quality.timeoutPenalty : 0)
     );
-    const score = Math.max(0, Math.min(100, Math.round(coverageScore * 0.45 + reliabilityScore * 0.55)));
+    const score = Math.max(
+      0,
+      Math.min(
+        100,
+        Math.round(coverageScore * config.quality.coverageWeight + reliabilityScore * config.quality.reliabilityWeight)
+      )
+    );
     perPillar[pillar] = {
       score,
-      level: score >= 80 ? "high" : score >= 60 ? "medium" : "low",
+      level:
+        score >= config.quality.highConfidenceThreshold
+          ? "high"
+          : score >= config.quality.mediumConfidenceThreshold
+            ? "medium"
+            : "low",
       scoreComponents: { coverageScore, reliabilityScore, warningCount, scannerFailed, modelFailed },
     };
     confidenceScore[pillar] = score;
     sourceCoverage[pillar] = {
       sourceFamilies: uniqueFamilies,
       sourceCount: safeSourceCount,
-      expectedSources: expectedSources[pillar],
+      expectedSources,
     };
     dataFreshness[pillar] = {
       extractedAt: meta.extractedAt,
       freshness: freshnessBucket(meta.extractedAt),
     };
     pillarCoverage[pillar] = {
-      tasksSucceeded: scannerFailed ? 0 : expectedTasks[pillar],
-      tasksExpected: expectedTasks[pillar],
+      tasksSucceeded: scannerFailed ? 0 : expectedTasks,
+      tasksExpected: expectedTasks,
     };
   }
   const global = Math.round(pillars.reduce((sum, p) => sum + (confidenceScore[p] || 0), 0) / pillars.length);
   confidenceScore.global = global;
-  confidenceScore.level = global >= 80 ? "high" : global >= 60 ? "medium" : "low";
+  confidenceScore.level =
+    global >= config.quality.highConfidenceThreshold
+      ? "high"
+      : global >= config.quality.mediumConfidenceThreshold
+        ? "medium"
+        : "low";
   const crossChecks = (Array.isArray(anomalies) ? anomalies : []).map((note, idx) => ({
     id: `anomaly_${idx + 1}`,
     status: "conflict",
     note,
   }));
-  return { pillarCoverage, sourceCoverage, dataFreshness, crossChecks, confidenceScore, perPillar };
+  return {
+    pillarCoverage,
+    sourceCoverage,
+    dataFreshness,
+    crossChecks,
+    confidenceScore,
+    perPillar,
+    partialThreshold: config.quality.partialDataThreshold,
+  };
+}
+
+const PILLAR_PROGRESS = { infra: 15, build: 30, buyer: 50, risk: 65, competitors: 78 };
+const PILLAR_LABELS = {
+  infra: "TinyFish Agent · Infrastructure",
+  build: "TinyFish Agent · Build surface",
+  buyer: "TinyFish Agent · Buyer pricing",
+  risk: "TinyFish Agent · Risk audit",
+  competitors: "TinyFish Agent · Competitors",
+};
+
+function createTinyFishProgress(engine, emit) {
+  const platforms = new Set(["Target site", "TinyFish Web Agent"]);
+  return (pillar) => (event) => {
+    const mapped = engine.mapTinyFishEvent(event);
+    if (!mapped) return;
+    if (mapped.kind === "streaming") platforms.add("TinyFish live browser");
+    if (mapped.message) {
+      emit({
+        step: `${pillar}_${mapped.kind || "event"}`,
+        pillar,
+        message: mapped.message,
+        progress: PILLAR_PROGRESS[pillar] ?? 20,
+        platformsScanned: [...platforms],
+        streamingUrl: mapped.streamingUrl || undefined,
+      });
+    }
+  };
 }
 
 async function runInvestigation({ targetUrl, domain, onProgress }) {
-  const name = domain.split(".")[0].charAt(0).toUpperCase() + domain.split(".")[0].slice(1);
-  const tinyfish = new TinyFishWebAgentClient(config.tinyfish);
+  const name = companyNameFromDomain(domain);
+  const engine = new TinyFishEngine(config.tinyfish);
   const emit = onProgress || (() => {});
   const scannerErrors = { infra: null, build: null, buyer: null, risk: null, competitors: null };
-  const fastOpt = { fast: config.fastMode };
+  const fastOpt = {
+    fast: config.fastMode,
+    onEvent: null,
+  };
 
   const runScanner = async (key, scannerPromiseFactory, fallback) => {
     try {
@@ -268,54 +303,86 @@ async function runInvestigation({ targetUrl, domain, onProgress }) {
     }
   };
 
-  emit({ step: "init", message: "Initializing TinyFish engine...", progress: 5, platformsScanned: config.platformsScanned });
+  emit({
+    step: "init",
+    message: "Initializing TinyFish engine (Agent + Search + Fetch)...",
+    progress: 5,
+    platformsScanned: ["Target site", "TinyFish Web Agent"],
+  });
 
-  // Run all four pillars in parallel to stay under time limit
-  const partial = { infra: null, build: null, buyer: null, risk: null };
+  const partial = { infra: null, build: null, buyer: null, risk: null, competitors: null };
   const infraP = runScanner(
     "infra",
-    () => new InfraCostScanner(tinyfish).scan(targetUrl, fastOpt),
+    () => {
+      fastOpt.onEvent = createTinyFishProgress(engine, emit)("infra");
+      return new InfraCostScanner(engine).scan(targetUrl, fastOpt);
+    },
     {}
   ).then((r) => {
     partial.infra = r;
+    emit({ step: "infra_active", message: PILLAR_LABELS.infra, progress: PILLAR_PROGRESS.infra, platformsScanned: ["Target site", "TinyFish Fetch API", PILLAR_LABELS.infra] });
     return r;
   });
   const buildP = runScanner(
     "build",
-    () => new BuildCostEstimator(tinyfish).scan(targetUrl, fastOpt),
+    () => {
+      fastOpt.onEvent = createTinyFishProgress(engine, emit)("build");
+      return new BuildCostEstimator(engine).scan(targetUrl, fastOpt);
+    },
     { features: [], openSource: [], hiring: null }
   ).then((r) => {
     partial.build = r;
+    emit({ step: "build_active", message: PILLAR_LABELS.build, progress: PILLAR_PROGRESS.build, platformsScanned: ["Target site", "TinyFish Fetch API", PILLAR_LABELS.build] });
     return r;
   });
   const buyerP = runScanner(
     "buyer",
-    () => new BuyerCostAnalyzer(tinyfish).scan(targetUrl, fastOpt),
+    () => {
+      fastOpt.onEvent = createTinyFishProgress(engine, emit)("buyer");
+      return new BuyerCostAnalyzer(engine).scan(targetUrl, fastOpt);
+    },
     { pricing: null, reviewInsights: [], limits: [], competitors: [] }
   ).then((r) => {
     partial.buyer = r;
+    emit({ step: "buyer_active", message: PILLAR_LABELS.buyer, progress: PILLAR_PROGRESS.buyer, platformsScanned: ["Target site", "TinyFish Fetch API", "TinyFish Search API", PILLAR_LABELS.buyer] });
     return r;
   });
   const riskP = runScanner(
     "risk",
-    () => new TechRiskScanner(tinyfish).scan(targetUrl, fastOpt),
+    () => {
+      fastOpt.onEvent = createTinyFishProgress(engine, emit)("risk");
+      return new TechRiskScanner(engine).scan(targetUrl, fastOpt);
+    },
     { securityHeaders: null, privacyCompliance: null, trackers: [] }
   ).then((r) => {
     partial.risk = r;
+    emit({ step: "risk_active", message: PILLAR_LABELS.risk, progress: PILLAR_PROGRESS.risk, platformsScanned: ["Target site", "TinyFish Fetch API", PILLAR_LABELS.risk] });
+    return r;
+  });
+  const competitorsP = runScanner(
+    "competitors",
+    () => {
+      fastOpt.onEvent = createTinyFishProgress(engine, emit)("competitors");
+      return new CompetitorScanner(engine).scan(targetUrl, domain, fastOpt);
+    },
+    { competitors: [], _meta: normalizePillarMeta(null, "competitors") }
+  ).then((r) => {
+    partial.competitors = r;
+    emit({
+      step: "competitors_active",
+      message: PILLAR_LABELS.competitors,
+      progress: PILLAR_PROGRESS.competitors,
+      platformsScanned: ["TinyFish Search API", PILLAR_LABELS.competitors],
+    });
     return r;
   });
 
-  const timeoutMs = config.investigationTimeoutMs || 100000;
-  const timeoutP = new Promise((_, rej) =>
-    setTimeout(() => rej({ _timeout: true }), timeoutMs)
-  );
+  const timeoutMs = config.investigationTimeoutMs;
+  const timeoutP = new Promise((_, rej) => setTimeout(() => rej({ _timeout: true }), timeoutMs));
 
   let timedOut = false;
   try {
-    await Promise.race([
-      Promise.allSettled([infraP, buildP, buyerP, riskP]),
-      timeoutP,
-    ]);
+    await Promise.race([Promise.allSettled([infraP, buildP, buyerP, riskP, competitorsP]), timeoutP]);
   } catch (e) {
     if (e?._timeout) {
       timedOut = true;
@@ -329,6 +396,15 @@ async function runInvestigation({ targetUrl, domain, onProgress }) {
   const buildRaw = partial.build ?? { features: [], openSource: [], hiring: null };
   const buyerRaw = partial.buyer ?? { pricing: null, reviewInsights: [], limits: [], competitors: [] };
   const riskRaw = partial.risk ?? { securityHeaders: null, privacyCompliance: null, trackers: [] };
+  const competitorsRaw = partial.competitors ?? { competitors: [], _meta: normalizePillarMeta(null, "competitors") };
+  const enrichment = enrichScannerPayload({
+    infraRaw,
+    buildRaw,
+    buyerRaw,
+    riskRaw,
+    competitorsRaw,
+    targetUrl,
+  });
 
   emit({ step: "infra_done", message: "Infrastructure analysis complete", progress: 35 });
   emit({ step: "build_done", message: "Build cost estimation complete", progress: 55 });
@@ -336,10 +412,15 @@ async function runInvestigation({ targetUrl, domain, onProgress }) {
   emit({ step: "risk_done", message: "Risk scan complete", progress: 80 });
   emit({ step: "ai", message: "AI synthesizing cost intelligence report...", progress: 85 });
 
+  const openaiConfig = {
+    ...config.openai,
+    quality: config.quality,
+    bounds: config.analysis.bounds,
+  };
+  const modeler = new CostModeler(openaiConfig);
   let report;
-  const modeler = new CostModeler(config.openai);
   try {
-    report = await modeler.analyze(infraRaw, buildRaw, buyerRaw, { name, url: domain });
+    report = await modeler.analyze(infraRaw, buildRaw, buyerRaw, { name, url: domain }, enrichment);
   } catch (error) {
     console.error("[CostLens] Cost modeler failed:", error);
     throw new Error(error?.message || "AI report synthesis failed");
@@ -347,110 +428,57 @@ async function runInvestigation({ targetUrl, domain, onProgress }) {
 
   emit({ step: "ai_extra", message: "Generating executive summary and risk analysis...", progress: 92 });
 
-  // Run executive summary, negotiation playbook, and risk analysis in parallel
   const targetInfo = { name, url: domain };
-  const [execSummaryRes, negotiationRes, riskProfileRes] = await Promise.allSettled([
+  const [execSummaryRes, negotiationRes, riskProfileRes, competitorAnalysisRes] = await Promise.allSettled([
     modeler.generateExecutiveSummary(report.infraCost, report.buildCost, report.buyerCost, targetInfo),
     modeler.generateNegotiationPlaybook(report.infraCost, report.buyerCost, targetInfo),
-    modeler.analyzeRiskProfile(riskRaw, targetInfo),
+    modeler.analyzeRiskProfile(riskRaw, targetInfo, enrichment),
+    modeler.generateCompetitorAnalysis(competitorsRaw, report.buyerCost, targetInfo),
   ]);
 
   const executiveSummary = execSummaryRes.status === "fulfilled" ? execSummaryRes.value : null;
   const negotiation = negotiationRes.status === "fulfilled" ? negotiationRes.value : null;
   const riskProfile = riskProfileRes.status === "fulfilled" ? riskProfileRes.value : modeler.getDefaultRiskProfile();
+  const competitorAnalysis = competitorAnalysisRes.status === "fulfilled" ? competitorAnalysisRes.value : null;
 
   emit({ step: "complete", message: "Investigation complete", progress: 100 });
-  const failedPillars = Object.entries(scannerErrors).filter(([, v]) => Boolean(v)).map(([k]) => k);
-  if (timedOut) {
-    failedPillars.push("timeout");
-  }
-  const modelErrors = report?.quality?.modelErrors || {};
-  const modelWarnings = report?.quality?.modelWarnings || {};
-  const anomalies = report?.quality?.anomalies || [];
-  const degradedByModel = Object.entries(modelErrors).filter(([, v]) => Boolean(v)).map(([k]) => k);
-  const degradedByWarnings = Object.entries(modelWarnings).filter(([, v]) => Array.isArray(v) && v.length > 0).map(([k]) => k);
-  const degradedPillars = [...new Set([...failedPillars, ...degradedByModel, ...degradedByWarnings])];
+
   const pillarMeta = {
     infra: normalizePillarMeta(infraRaw, "infra"),
     build: normalizePillarMeta(buildRaw, "build"),
     buyer: normalizePillarMeta(buyerRaw, "buyer"),
     risk: normalizePillarMeta(riskRaw, "risk"),
-    competitors: normalizePillarMeta(null, "competitors"),
+    competitors: normalizePillarMeta(competitorsRaw, "competitors"),
   };
   const qualityMeta = buildQualityMeta({
     scannerErrors,
-    modelErrors,
-    modelWarnings,
-    anomalies,
+    modelErrors: report?.quality?.modelErrors || {},
+    modelWarnings: report?.quality?.modelWarnings || {},
+    anomalies: report?.quality?.anomalies || [],
     pillarMeta,
     timedOut,
     fastMode: Boolean(config.fastMode),
   });
-  const totalPillars = 5;
-  const legacyCompleteness = Math.max(0, Math.round(((totalPillars - Math.min(totalPillars, degradedPillars.length)) / totalPillars) * 100));
 
-  return {
-    target: { name, url: domain, logo: name[0] },
-    scannedAt: new Date().toISOString(),
-    platformsScanned: config.platformsScanned,
-    ...report,
-    executiveSummary: executiveSummary || null,
-    negotiation: negotiation || null,
-    riskProfile: riskProfile || modeler.getDefaultRiskProfile(),
-    infraCost: {
-      ...report.infraCost,
-      confidence: {
-        overall: qualityMeta.perPillar.infra.score,
-        level: qualityMeta.perPillar.infra.level,
-      },
-    },
-    buildCost: {
-      ...report.buildCost,
-      confidence: {
-        overall: qualityMeta.perPillar.build.score,
-        level: qualityMeta.perPillar.build.level,
-      },
-    },
-    buyerCost: {
-      ...report.buyerCost,
-      confidence: {
-        overall: qualityMeta.perPillar.buyer.score,
-        level: qualityMeta.perPillar.buyer.level,
-      },
-    },
-    provenance: {
-      infra: {
-        evidenceSources: report?.infraCost?.evidenceSources || [],
-        extractedAt: pillarMeta.infra.extractedAt,
-      },
-      build: {
-        evidenceSources: report?.buildCost?.evidenceSources || [],
-        extractedAt: pillarMeta.build.extractedAt,
-      },
-      buyer: {
-        evidenceSources: report?.buyerCost?.evidenceSources || [],
-        extractedAt: pillarMeta.buyer.extractedAt,
-      },
-      risk: {
-        evidenceSources: [],
-        extractedAt: pillarMeta.risk.extractedAt,
-      },
-      competitors: {
-        evidenceSources: [],
-        extractedAt: pillarMeta.competitors.extractedAt,
-      },
-    },
-    quality: {
-      partialData: degradedPillars.length > 0 || qualityMeta.confidenceScore.global < 80,
-      degradedPillars,
-      scannerErrors: timedOut ? { ...scannerErrors, timeout: "Investigation time limit reached; partial report." } : scannerErrors,
-      modelErrors,
-      modelWarnings,
-      anomalies,
-      completenessScore: legacyCompleteness,
-      qualityMeta,
-    },
-  };
+  return buildInvestigationReport({
+    name,
+    domain,
+    report,
+    infraRaw,
+    buildRaw,
+    buyerRaw,
+    riskRaw,
+    competitorsRaw,
+    executiveSummary,
+    negotiation,
+    riskProfile,
+    competitorAnalysis,
+    scannerErrors,
+    modeler,
+    qualityMeta,
+    timedOut,
+    fastMode: Boolean(config.fastMode),
+  });
 }
 
 function sendStructuredError(res, error) {
@@ -460,74 +488,26 @@ function sendStructuredError(res, error) {
   res.status(status).json(body);
 }
 
-// ---- Async investigation (TinyFish run-async + poll). Stays under Vercel limits. ----
-function getFastAsyncGoals(targetUrl, domain) {
-  const name = domain.split(".")[0];
-  return {
-    infra: {
-      url: targetUrl.startsWith("http") ? targetUrl : `https://${targetUrl}`,
-      goal: [
-        `Analyze ${domain} and infer infrastructure + traffic signals in one pass.`,
-        'Return strict JSON only: { "techStack": { "signals": {}, "cloudProvider": {}, "framework": "string", "cdn": "string" }, "traffic": { "cloudflareRadar": {}, "similarWeb": {}, "confidence": "high|medium|low", "notes": [] } }',
-        "Be concise. If uncertain, use conservative values.",
-      ].join(" "),
-    },
-    build: {
-      url: targetUrl.startsWith("http") ? targetUrl : `https://${targetUrl}`,
-      goal: [
-        "Analyze the product site and return detected build-relevant features.",
-        'Output strict JSON only: { "detected": [{ "name": "string", "complexity": "extreme|hard|medium", "evidence": "string" }], "pricingPageFeatures": ["string"] }',
-      ].join(" "),
-    },
-    buyer: {
-      url: targetUrl.startsWith("http") ? targetUrl : `https://${targetUrl}`,
-      goal: [
-        "Find and extract pricing page details including plan cards and fine print.",
-        'Return strict JSON only: { "plans": [{ "name": "string", "price": "string", "features": ["string"], "limits": ["string"] }], "finePrint": ["string"] }',
-      ].join(" "),
-    },
-    risk: {
-      url: targetUrl.startsWith("http") ? targetUrl : `https://${targetUrl}`,
-      goal: [
-        `Analyze ${domain} for security and compliance signals.`,
-        'Return strict JSON only: { "securityHeaders": { "https": true, "hsts": true, "csp": true, "xFrameOptions": "string|null", "xContentTypeOptions": true }, "privacyCompliance": { "privacyPolicyUrl": "string|null", "termsUrl": "string|null", "complianceBadges": ["string"], "cookieConsent": true }, "trackers": [{ "tracker": "string", "category": "analytics|advertising|social|functional|other", "dataShared": "string" }] }',
-        "Be conservative. Only list compliance badges if evidence exists on the site.",
-      ].join(" "),
-    },
-    competitors: {
-      url: targetUrl.startsWith("http") ? targetUrl : `https://${targetUrl}`,
-      goal: [
-        `Find the top 3-5 competitors or alternatives to ${name}. Visit comparison/alternatives pages, G2, Capterra, or similar sites if helpful.`,
-        `For each competitor return their name, website URL, a one-line description, and approximate starting price.`,
-        'Return strict JSON only: { "competitors": [{ "name": "string", "url": "string", "description": "string", "startingPrice": "string", "keyDifferentiator": "string" }] }',
-        "Only include competitors you are confident about. If unsure, return fewer.",
-      ].join(" "),
-    },
-  };
-}
-
+// ---- Async investigation ----
 function coerceRunResultToInfra(result) {
   if (!result || typeof result !== "object") {
     return { techStack: null, traffic: null, thirdParty: null, headcount: null, _meta: normalizePillarMeta(null, "infra") };
   }
-  const t = result.techStack ?? result;
-  const tr = result.traffic ?? null;
   const data = {
-    techStack: t && typeof t === "object" ? t : null,
-    traffic: tr && typeof tr === "object" ? tr : null,
-    thirdParty: null,
-    headcount: null,
+    techStack: result.techStack && typeof result.techStack === "object" ? result.techStack : null,
+    traffic: result.traffic && typeof result.traffic === "object" ? result.traffic : null,
+    thirdParty: Array.isArray(result.thirdParty) ? result.thirdParty : null,
+    headcount: result.headcount && typeof result.headcount === "object" ? result.headcount : null,
   };
+  const sourceFamilies = [];
+  if (data.techStack) sourceFamilies.push("techStack");
+  if (data.traffic) sourceFamilies.push("trafficSignals");
+  if (Array.isArray(data.thirdParty) && data.thirdParty.length) sourceFamilies.push("thirdParty");
+  if (data.headcount) sourceFamilies.push("headcount");
   return {
     ...data,
     _meta: normalizePillarMeta(
-      {
-        _meta: {
-          pillar: "infra",
-          extractedAt: new Date().toISOString(),
-          sourceFamilies: [data.techStack ? "techStack" : null, data.traffic ? "trafficSignals" : null].filter(Boolean),
-        },
-      },
+      { _meta: { pillar: "infra", extractedAt: new Date().toISOString(), sourceFamilies } },
       "infra"
     ),
   };
@@ -542,20 +522,17 @@ function coerceRunResultToBuild(result) {
       detected: Array.isArray(result.detected) ? result.detected : [],
       pricingPageFeatures: Array.isArray(result.pricingPageFeatures) ? result.pricingPageFeatures : [],
     },
-    openSource: [],
-    hiring: null,
+    openSource: Array.isArray(result.openSource) ? result.openSource : [],
+    hiring: result.hiring && typeof result.hiring === "object" ? result.hiring : null,
   };
+  const sourceFamilies = [];
+  if (data.features.detected.length || data.features.pricingPageFeatures.length) sourceFamilies.push("features");
+  if (data.openSource.length) sourceFamilies.push("openSource");
+  if (data.hiring) sourceFamilies.push("hiringBenchmarks");
   return {
     ...data,
     _meta: normalizePillarMeta(
-      {
-        _meta: {
-          pillar: "build",
-          extractedAt: new Date().toISOString(),
-          sourceFamilies:
-            data.features.detected.length > 0 || data.features.pricingPageFeatures.length > 0 ? ["features"] : [],
-        },
-      },
+      { _meta: { pillar: "build", extractedAt: new Date().toISOString(), sourceFamilies } },
       "build"
     ),
   };
@@ -565,16 +542,23 @@ function coerceRunResultToBuyer(result) {
   if (!result || typeof result !== "object") {
     return { pricing: null, reviewInsights: [], limits: [], competitors: [], _meta: normalizePillarMeta(null, "buyer") };
   }
-  const p = result.plans;
   const data = {
-    pricing: result.plans !== undefined ? { plans: Array.isArray(p) ? p : [], finePrint: result.finePrint || [] } : null,
-    reviewInsights: [],
-    limits: [],
-    competitors: [],
+    pricing: result.plans !== undefined ? { plans: Array.isArray(result.plans) ? result.plans : [], finePrint: result.finePrint || [] } : null,
+    reviewInsights: result.reviewInsights && typeof result.reviewInsights === "object" ? result.reviewInsights : [],
+    limits: Array.isArray(result.limits) ? result.limits : [],
+    competitors: Array.isArray(result.competitors) ? result.competitors : [],
   };
   const sourceFamilies = [];
   if (data.pricing?.plans?.length) sourceFamilies.push("pricing");
   if (data.pricing?.finePrint?.length) sourceFamilies.push("pricingFinePrint");
+  if (
+    (Array.isArray(data.reviewInsights?.g2) && data.reviewInsights.g2.length) ||
+    (Array.isArray(data.reviewInsights?.reddit) && data.reviewInsights.reddit.length)
+  ) {
+    sourceFamilies.push("reviews");
+  }
+  if (data.limits.length) sourceFamilies.push("limitsDocs");
+  if (data.competitors.length) sourceFamilies.push("competitors");
   return {
     ...data,
     _meta: normalizePillarMeta(
@@ -608,11 +592,22 @@ function coerceRunResultToRisk(result) {
 
 function coerceRunResultToCompetitors(result) {
   if (!result || typeof result !== "object") {
-    return { competitors: [] };
+    return { competitors: [], _meta: normalizePillarMeta(null, "competitors") };
   }
   const competitors = Array.isArray(result.competitors) ? result.competitors : [];
+  const filtered = competitors.filter((c) => c && typeof c === "object" && typeof c.name === "string" && c.name.trim());
   return {
-    competitors: competitors.filter((c) => c && typeof c === "object" && typeof c.name === "string" && c.name.trim()),
+    competitors: filtered,
+    _meta: normalizePillarMeta(
+      {
+        _meta: {
+          pillar: "competitors",
+          extractedAt: new Date().toISOString(),
+          sourceFamilies: filtered.length ? ["competitors"] : [],
+        },
+      },
+      "competitors"
+    ),
   };
 }
 
@@ -620,40 +615,62 @@ app.post("/api/investigate/async", async (req, res) => {
   try {
     assertRuntimeEnvReady();
     const { targetUrl, domain } = normalizeTargetUrl(req.body?.url);
-    const name = domain.split(".")[0].charAt(0).toUpperCase() + domain.split(".")[0].slice(1);
-    const goals = getFastAsyncGoals(targetUrl, domain);
-    const tinyfish = new TinyFishWebAgentClient(config.tinyfish);
+    const name = companyNameFromDomain(domain);
+    const engine = new TinyFishEngine(config.tinyfish);
+    const strategy = config.tinyfish.asyncStrategy;
+    const runIds = {};
 
-    const [infraRun, buildRun, buyerRun, riskRun, competitorsRun] = await Promise.allSettled([
-      tinyfish.runAsync(goals.infra),
-      tinyfish.runAsync(goals.build),
-      tinyfish.runAsync(goals.buyer),
-      tinyfish.runAsync(goals.risk),
-      tinyfish.runAsync(goals.competitors),
-    ]);
-
-    const infraRes = infraRun.status === "fulfilled" ? infraRun.value : { error: { message: infraRun.reason?.message || "infra run failed" } };
-    const buildRes = buildRun.status === "fulfilled" ? buildRun.value : { error: { message: buildRun.reason?.message || "build run failed" } };
-    const buyerRes = buyerRun.status === "fulfilled" ? buyerRun.value : { error: { message: buyerRun.reason?.message || "buyer run failed" } };
-    const riskRes = riskRun.status === "fulfilled" ? riskRun.value : { error: { message: riskRun.reason?.message || "risk run failed" } };
-    const competitorsRes = competitorsRun.status === "fulfilled" ? competitorsRun.value : { error: { message: competitorsRun.reason?.message || "competitors run failed" } };
-    const runIds = {
-      infra: infraRes?.run_id ?? null,
-      build: buildRes?.run_id ?? null,
-      buyer: buyerRes?.run_id ?? null,
-      risk: riskRes?.run_id ?? null,
-      competitors: competitorsRes?.run_id ?? null,
-    };
-    if (infraRes?.error?.message) runIds._infraError = infraRes.error.message;
-    if (buildRes?.error?.message) runIds._buildError = buildRes.error.message;
-    if (buyerRes?.error?.message) runIds._buyerError = buyerRes.error.message;
-    if (riskRes?.error?.message) runIds._riskError = riskRes.error.message;
-    if (competitorsRes?.error?.message) runIds._competitorsError = competitorsRes.error.message;
-    if (!runIds.infra && !runIds.build && !runIds.buyer && !runIds.risk) {
-      return res.status(502).json({ error: "Failed to start async investigation runs.", runIds, domain, name });
+    if (strategy === "queue") {
+      const queued = await engine.queueAllPillars(targetUrl, domain);
+      if (queued.errors?.length) {
+        console.warn("[CostLens] Async queue partial failures:", queued.errors);
+      }
+      for (const item of queued.runIds || []) {
+        runIds[item.pillar] = item.run_id;
+      }
+      if (!runIds.infra && !runIds.build && !runIds.buyer && !runIds.risk) {
+        return res.status(502).json({
+          error: "Failed to queue async investigation runs.",
+          errors: queued.errors,
+          domain,
+          name,
+          strategy,
+        });
+      }
+      return res.status(200).json({ runIds, domain, name, partial: false, strategy });
     }
-    const partial = [runIds._infraError, runIds._buildError, runIds._buyerError, runIds._riskError, runIds._competitorsError].some(Boolean);
-    res.status(partial ? 207 : 200).json({ runIds, domain, name, partial });
+
+    let batchRes;
+    try {
+      batchRes = await engine.runBatchAllPillars(targetUrl, domain);
+    } catch (error) {
+      return res.status(502).json({
+        error: error?.message || "Failed to start batch investigation runs.",
+        domain,
+        name,
+        strategy,
+      });
+    }
+
+    if (batchRes?.error?.message) {
+      return res.status(502).json({
+        error: batchRes.error.message,
+        domain,
+        name,
+        strategy,
+      });
+    }
+
+    const runIdList = Array.isArray(batchRes?.run_ids) ? batchRes.run_ids : [];
+    for (let i = 0; i < ASYNC_PILLAR_ORDER.length; i++) {
+      runIds[ASYNC_PILLAR_ORDER[i]] = runIdList[i] ?? null;
+    }
+
+    if (!runIds.infra && !runIds.build && !runIds.buyer && !runIds.risk) {
+      return res.status(502).json({ error: "Failed to start async investigation runs.", runIds, domain, name, strategy });
+    }
+
+    res.status(200).json({ runIds, domain, name, partial: false, strategy });
   } catch (error) {
     console.error("[CostLens] Async start error:", error);
     sendStructuredError(res, error);
@@ -665,24 +682,30 @@ app.post("/api/investigate/async/poll", async (req, res) => {
     assertRuntimeEnvReady();
     assertValidAsyncPollPayload(req.body);
     const { runIds, domain, name } = req.body || {};
-    const tinyfish = new TinyFishWebAgentClient(config.tinyfish);
+    const engine = new TinyFishEngine(config.tinyfish);
 
-    const safeGetRun = async (runId) => {
-      if (!runId) return { status: "FAILED", error: { message: "Missing run id" }, result: null };
-      try {
-        return await tinyfish.getRun(runId);
-      } catch (error) {
-        return { status: "FAILED", error: { message: error?.message || "Run lookup failed" }, result: null };
-      }
-    };
+    const lookupIds = ASYNC_PILLAR_ORDER.map((pillar) => runIds[pillar]).filter(Boolean);
+    let batchLookup = { data: [], not_found: [] };
+    try {
+      batchLookup = await engine.getRunsBatch(lookupIds);
+    } catch (error) {
+      console.error("[CostLens] Batch run lookup failed:", error);
+    }
 
-    const [infraRun, buildRun, buyerRun, riskRun, competitorsRun] = await Promise.all([
-      safeGetRun(runIds.infra),
-      safeGetRun(runIds.build),
-      safeGetRun(runIds.buyer),
-      safeGetRun(runIds.risk),
-      safeGetRun(runIds.competitors),
-    ]);
+    const runById = new Map((batchLookup.data || []).map((run) => [run.run_id, run]));
+    const missingRun = (pillar) => ({
+      status: "FAILED",
+      error: { message: runIds[pillar] ? "Run lookup failed" : "Missing run id" },
+      result: null,
+    });
+
+    const infraRun = runIds.infra ? runById.get(runIds.infra) ?? missingRun("infra") : missingRun("infra");
+    const buildRun = runIds.build ? runById.get(runIds.build) ?? missingRun("build") : missingRun("build");
+    const buyerRun = runIds.buyer ? runById.get(runIds.buyer) ?? missingRun("buyer") : missingRun("buyer");
+    const riskRun = runIds.risk ? runById.get(runIds.risk) ?? missingRun("risk") : missingRun("risk");
+    const competitorsRun = runIds.competitors
+      ? runById.get(runIds.competitors) ?? missingRun("competitors")
+      : missingRun("competitors");
 
     const statuses = {
       infra: infraRun?.status ?? "FAILED",
@@ -702,15 +725,28 @@ app.post("/api/investigate/async/poll", async (req, res) => {
     const riskRaw = coerceRunResultToRisk(riskRun?.result);
     const competitorsRaw = coerceRunResultToCompetitors(competitorsRun?.result);
 
-    const modeler = new CostModeler(config.openai);
-    const report = await modeler.analyze(infraRaw, buildRaw, buyerRaw, { name, url: domain });
+    const enrichment = enrichScannerPayload({
+      infraRaw,
+      buildRaw,
+      buyerRaw,
+      riskRaw,
+      competitorsRaw,
+      targetUrl: `https://${domain}`,
+    });
 
-    // Generate executive summary, negotiation playbook, risk profile, and competitor analysis
+    const openaiConfig = {
+      ...config.openai,
+      quality: config.quality,
+      bounds: config.analysis.bounds,
+    };
+    const modeler = new CostModeler(openaiConfig);
+    const report = await modeler.analyze(infraRaw, buildRaw, buyerRaw, { name, url: domain }, enrichment);
+
     const targetInfo = { name, url: domain };
     const [execSummaryRes, negotiationRes, riskProfileRes, competitorAnalysisRes] = await Promise.allSettled([
       modeler.generateExecutiveSummary(report.infraCost, report.buildCost, report.buyerCost, targetInfo),
       modeler.generateNegotiationPlaybook(report.infraCost, report.buyerCost, targetInfo),
-      modeler.analyzeRiskProfile(riskRaw, targetInfo),
+      modeler.analyzeRiskProfile(riskRaw, targetInfo, enrichment),
       modeler.generateCompetitorAnalysis(competitorsRaw, report.buyerCost, targetInfo),
     ]);
     const executiveSummary = execSummaryRes.status === "fulfilled" ? execSummaryRes.value : null;
@@ -725,13 +761,6 @@ app.post("/api/investigate/async/poll", async (req, res) => {
       risk: riskRun?.status === "COMPLETED" ? null : riskRun?.error?.message ?? "Run failed",
       competitors: competitorsRun?.status === "COMPLETED" ? null : competitorsRun?.error?.message ?? "Run failed",
     };
-    const failedPillars = Object.entries(scannerErrors).filter(([, v]) => Boolean(v)).map(([k]) => k);
-    const modelErrors = report?.quality?.modelErrors || {};
-    const modelWarnings = report?.quality?.modelWarnings || {};
-    const anomalies = report?.quality?.anomalies || [];
-    const degradedByModel = Object.entries(modelErrors).filter(([, v]) => Boolean(v)).map(([k]) => k);
-    const degradedByWarnings = Object.entries(modelWarnings).filter(([, v]) => Array.isArray(v) && v.length > 0).map(([k]) => k);
-    const degradedPillars = [...new Set([...failedPillars, ...degradedByModel, ...degradedByWarnings])];
     const pillarMeta = {
       infra: normalizePillarMeta(infraRaw, "infra"),
       build: normalizePillarMeta(buildRaw, "build"),
@@ -741,81 +770,35 @@ app.post("/api/investigate/async/poll", async (req, res) => {
     };
     const qualityMeta = buildQualityMeta({
       scannerErrors,
-      modelErrors,
-      modelWarnings,
-      anomalies,
+      modelErrors: report?.quality?.modelErrors || {},
+      modelWarnings: report?.quality?.modelWarnings || {},
+      anomalies: report?.quality?.anomalies || [],
       pillarMeta,
       timedOut: false,
       fastMode: true,
     });
-    const totalPillars = 5;
-  const legacyCompleteness = Math.max(0, Math.round(((totalPillars - Math.min(totalPillars, degradedPillars.length)) / totalPillars) * 100));
 
     res.json({
       status: "complete",
-      report: {
-        target: { name, url: domain, logo: name[0] },
-        scannedAt: new Date().toISOString(),
-        platformsScanned: config.platformsScanned,
-        ...report,
-        executiveSummary: executiveSummary || null,
-        negotiation: negotiation || null,
-        riskProfile: riskProfile || modeler.getDefaultRiskProfile(),
-        competitorAnalysis: competitorAnalysis || null,
-        infraCost: {
-          ...report.infraCost,
-          confidence: {
-            overall: qualityMeta.perPillar.infra.score,
-            level: qualityMeta.perPillar.infra.level,
-          },
-        },
-        buildCost: {
-          ...report.buildCost,
-          confidence: {
-            overall: qualityMeta.perPillar.build.score,
-            level: qualityMeta.perPillar.build.level,
-          },
-        },
-        buyerCost: {
-          ...report.buyerCost,
-          confidence: {
-            overall: qualityMeta.perPillar.buyer.score,
-            level: qualityMeta.perPillar.buyer.level,
-          },
-        },
-        provenance: {
-          infra: {
-            evidenceSources: report?.infraCost?.evidenceSources || [],
-            extractedAt: pillarMeta.infra.extractedAt,
-          },
-          build: {
-            evidenceSources: report?.buildCost?.evidenceSources || [],
-            extractedAt: pillarMeta.build.extractedAt,
-          },
-          buyer: {
-            evidenceSources: report?.buyerCost?.evidenceSources || [],
-            extractedAt: pillarMeta.buyer.extractedAt,
-          },
-          risk: {
-            evidenceSources: [],
-            extractedAt: pillarMeta.risk.extractedAt,
-          },
-          competitors: {
-            evidenceSources: [],
-            extractedAt: pillarMeta.competitors.extractedAt,
-          },
-        },
-        quality: {
-          partialData: degradedPillars.length > 0 || qualityMeta.confidenceScore.global < 80,
-          degradedPillars,
-          scannerErrors,
-          modelErrors,
-          modelWarnings,
-          anomalies,
-          completenessScore: legacyCompleteness,
-          qualityMeta,
-        },
-      },
+      report: buildInvestigationReport({
+        name,
+        domain,
+        report,
+        infraRaw,
+        buildRaw,
+        buyerRaw,
+        riskRaw,
+        competitorsRaw,
+        executiveSummary,
+        negotiation,
+        riskProfile,
+        competitorAnalysis,
+        scannerErrors,
+        modeler,
+        qualityMeta,
+        timedOut: false,
+        fastMode: true,
+      }),
     });
   } catch (error) {
     console.error("[CostLens] Async poll error:", error);
@@ -869,7 +852,7 @@ app.post("/api/investigate/stream", async (req, res) => {
     sendErrorAndEnd(new Error("Investigation timed out on the server. Try again or use a shorter run."));
   });
 
-  let lastProgress = { message: "Starting...", progress: 0, platformsScanned: config.platformsScanned };
+  let lastProgress = { message: "Starting...", progress: 0, platformsScanned: ["Target site", "TinyFish Web Agent"] };
   const heartbeatId = setInterval(() => {
     send("progress", { ...lastProgress, message: lastProgress.message + " — still running" });
   }, HEARTBEAT_INTERVAL_MS);

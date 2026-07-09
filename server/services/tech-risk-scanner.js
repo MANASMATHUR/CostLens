@@ -1,21 +1,18 @@
-// ============================================================
-// TECHNOLOGY RISK SCANNER
-// Pillar 4: Security, privacy, and compliance signals
-// Uses TinyFish run automation + structured extraction goals
-// ============================================================
+import { getInvestigationPillars } from "../tinyfish/pillars.js";
 
 export class TechRiskScanner {
-  constructor(tinyfishClient) {
-    this.tinyfish = tinyfishClient;
+  constructor(engine) {
+    this.engine = engine;
   }
 
   async scan(targetUrl, options = {}) {
     const fast = options.fast === true;
     const extractedAt = new Date().toISOString();
     const domain = new URL(targetUrl.startsWith("http") ? targetUrl : `https://${targetUrl}`).hostname;
+    const pillars = getInvestigationPillars(targetUrl, domain);
 
     const tasks = fast
-      ? [this.scanCombined(targetUrl, domain)]
+      ? [this.runRiskPillar(pillars.risk, targetUrl, options.onEvent)]
       : [
           this.scanSecurityHeaders(targetUrl, domain),
           this.scanPrivacyCompliance(targetUrl, domain),
@@ -35,81 +32,59 @@ export class TechRiskScanner {
       return result;
     }
 
-    const securityHeaders = results[0]?.status === "fulfilled" ? results[0].value : null;
-    const privacyCompliance = results[1]?.status === "fulfilled" ? results[1].value : null;
-    const trackers = results[2]?.status === "fulfilled" ? results[2].value : [];
-
-    const result = { securityHeaders, privacyCompliance, trackers };
+    const result = {
+      securityHeaders: results[0]?.status === "fulfilled" ? results[0].value : null,
+      privacyCompliance: results[1]?.status === "fulfilled" ? results[1].value : null,
+      trackers: results[2]?.status === "fulfilled" ? results[2].value : [],
+    };
     result._meta = this.buildMeta(result, extractedAt);
     return result;
   }
 
-  async scanCombined(targetUrl, domain) {
-    return this.tinyfish.runJson({
-      url: targetUrl,
-      goal: `Analyze ${domain} for security and compliance signals in one pass.
-Return strict JSON only:
-{
-  "securityHeaders": {
-    "https": true/false,
-    "hsts": true/false,
-    "csp": true/false,
-    "xFrameOptions": "string|null",
-    "xContentTypeOptions": true/false,
-    "cookieFlags": ["string"]
-  },
-  "privacyCompliance": {
-    "privacyPolicyUrl": "string|null",
-    "termsUrl": "string|null",
-    "complianceBadges": ["SOC2", "GDPR", "HIPAA", "ISO27001"],
-    "cookieConsent": true/false
-  },
-  "trackers": [{ "tracker": "string", "category": "analytics|advertising|social|functional|other", "dataShared": "string" }]
-}
-Be conservative. Only list compliance badges if you find evidence on the site.`,
-    });
+  async runRiskPillar(definition, targetUrl, onEvent) {
+    let extraGoal = "";
+    try {
+      const fetched = await this.engine.fetchMarkdown(targetUrl);
+      extraGoal = this.engine.formatFetchContext(fetched, 2500);
+    } catch (error) {
+      console.warn("[CostLens] Risk fetch prefetch failed:", error?.message);
+    }
+    const response = await this.engine.runPillar(definition, { onEvent, extraGoal });
+    return this._coerceCombinedRisk(response);
+  }
+
+  _coerceCombinedRisk(response) {
+    const raw = response?.result && typeof response.result === "object" ? response.result : {};
+    return {
+      securityHeaders: raw.securityHeaders ?? null,
+      privacyCompliance: raw.privacyCompliance ?? null,
+      trackers: Array.isArray(raw.trackers) ? raw.trackers : [],
+    };
   }
 
   async scanSecurityHeaders(targetUrl, domain) {
-    return this.tinyfish.runJson({
+    const response = await this.engine.client.runJson({
       url: targetUrl,
-      goal: `Analyze security headers, HTTPS configuration, CSP, HSTS, X-Frame-Options, X-Content-Type-Options, and cookie flags for ${domain}.
-Return strict JSON only:
-{
-  "https": true/false,
-  "hsts": true/false,
-  "csp": true/false,
-  "xFrameOptions": "string|null",
-  "xContentTypeOptions": true/false,
-  "cookieFlags": ["HttpOnly", "Secure", "SameSite"],
-  "notes": ["string"]
-}`,
+      goal: `Analyze security headers, HTTPS, CSP, HSTS, X-Frame-Options, X-Content-Type-Options, and cookie flags for ${domain}. Return strict JSON with https, hsts, csp, xFrameOptions, xContentTypeOptions, cookieFlags, notes.`,
     });
+    return response?.result ?? null;
   }
 
   async scanPrivacyCompliance(targetUrl, domain) {
-    return this.tinyfish.runJson({
+    const response = await this.engine.client.runJson({
       url: targetUrl,
-      goal: `Find privacy policy, terms of service, and compliance badges (SOC2, GDPR, HIPAA, ISO27001) on ${domain}. Check for cookie consent banners.
-Return strict JSON only:
-{
-  "privacyPolicyUrl": "string|null",
-  "termsUrl": "string|null",
-  "complianceBadges": ["string"],
-  "cookieConsent": true/false,
-  "dataProcessingInfo": "string|null"
-}
-Only include compliance badges that are explicitly mentioned or displayed on the site.`,
+      goal: `Find privacy policy, terms, compliance badges, and cookie consent on ${domain}. Return strict JSON with privacyPolicyUrl, termsUrl, complianceBadges, cookieConsent, dataProcessingInfo.`,
     });
+    return response?.result ?? null;
   }
 
   async scanThirdPartyTrackers(targetUrl, domain) {
-    return this.tinyfish.runJson({
+    const response = await this.engine.client.runJson({
       url: targetUrl,
-      goal: `Identify all third-party trackers, analytics scripts, and data-sharing integrations on ${domain}.
-Return strict JSON only as an array:
-[{ "tracker": "string", "category": "analytics|advertising|social|functional|other", "dataShared": "string" }]`,
+      goal: `Identify third-party trackers on ${domain}. Return strict JSON array: [{ "tracker": string, "category": string, "dataShared": string }]`,
     });
+    const result = response?.result;
+    return Array.isArray(result) ? result : Array.isArray(result?.trackers) ? result.trackers : [];
   }
 
   buildMeta(result, extractedAt) {
@@ -117,19 +92,10 @@ Return strict JSON only as an array:
     if (this._hasData(result?.securityHeaders)) sourceFamilies.push("securityHeaders");
     if (this._hasData(result?.privacyCompliance)) sourceFamilies.push("privacyCompliance");
     if (Array.isArray(result?.trackers) && result.trackers.length > 0) sourceFamilies.push("trackers");
-    return {
-      extractedAt,
-      sourceFamilies,
-      sourceCount: sourceFamilies.length,
-    };
+    return { extractedAt, sourceFamilies, sourceCount: sourceFamilies.length };
   }
 
   _hasData(value) {
-    return Boolean(
-      value &&
-      typeof value === "object" &&
-      !Array.isArray(value) &&
-      Object.keys(value).length > 0
-    );
+    return Boolean(value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length > 0);
   }
 }
